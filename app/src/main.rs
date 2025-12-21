@@ -10,7 +10,7 @@ mod components;
 use components::dashboard::Dashboard;
 use components::filters::Filters;
 use components::nav::Navigation;
-use components::requests::Requests;
+use components::requests::{start_request_listener, Requests};
 use components::settings::{CustomFilters, Exclusions, Settings};
 
 const STYLES: Asset = asset!("/assets/styles.css");
@@ -64,6 +64,9 @@ fn MainLayout() -> Element {
                 let server = privaxy::start_privaxy().await;
                 log::info!("Privaxy server started on http://127.0.0.1:8100");
                 *PRIVAXY_SERVER.write() = Some(Arc::new(RwLock::new(server)));
+                
+                // Start the global request listener
+                start_request_listener();
             }
         });
     });

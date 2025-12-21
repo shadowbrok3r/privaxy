@@ -5,9 +5,12 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use reqwest::redirect::Policy;
+use rustls::crypto::ring::default_provider;
+use rustls::crypto::CryptoProvider;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
@@ -19,6 +22,11 @@ pub mod configuration;
 pub mod events;
 mod proxy;
 pub mod statistics;
+
+// Higher connection limit - keep-alive connections stay open
+const MAX_CONNECTIONS: usize = 1024;
+// Shorter timeout for idle connections
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct PrivaxyServer {
@@ -33,6 +41,9 @@ pub struct PrivaxyServer {
 }
 
 pub async fn start_privaxy() -> PrivaxyServer {
+    // Install the ring crypto provider for rustls
+    let _ = CryptoProvider::install_default(default_provider());
+
     let ip = [127, 0, 0, 1];
 
     // We use reqwest instead of hyper's client to perform most of the proxying as it's more convenient
@@ -44,6 +55,9 @@ pub async fn start_privaxy() -> PrivaxyServer {
         .gzip(true)
         .brotli(true)
         .deflate(true)
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(10)
         .build()
         .unwrap();
 
@@ -132,6 +146,9 @@ pub async fn start_privaxy() -> PrivaxyServer {
     let blocker_requester_for_server = blocker_requester.clone();
     let local_exclusion_store_for_server = local_exclusion_store.clone();
 
+    // Track active connections
+    let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     tokio::spawn(async move {
         let listener = TcpListener::bind(proxy_server_addr).await.unwrap();
         log::info!("Proxy available at http://{}", proxy_server_addr);
@@ -141,9 +158,21 @@ pub async fn start_privaxy() -> PrivaxyServer {
                 Ok(conn) => conn,
                 Err(e) => {
                     log::error!("Failed to accept connection: {}", e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
             };
+
+            // Check connection count
+            let current = active_connections.load(std::sync::atomic::Ordering::Relaxed);
+            if current >= MAX_CONNECTIONS {
+                log::warn!("Connection limit reached ({}), dropping connection from {}", current, client_addr);
+                drop(stream);
+                continue;
+            }
+
+            let conn_count = active_connections.clone();
+            conn_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             let client_ip_address = client_addr.ip();
             let io = TokioIo::new(stream);
@@ -169,14 +198,28 @@ pub async fn start_privaxy() -> PrivaxyServer {
                     )
                 });
 
-                if let Err(err) = http1::Builder::new()
-                    .preserve_header_case(true)
-                    .title_case_headers(true)
-                    .serve_connection(io, service)
-                    .with_upgrades()
-                    .await
-                {
-                    log::debug!("Connection error: {}", err);
+                // Serve with timeout
+                let result = tokio::time::timeout(
+                    IDLE_TIMEOUT,
+                    http1::Builder::new()
+                        .preserve_header_case(true)
+                        .title_case_headers(true)
+                        .keep_alive(true)
+                        .serve_connection(io, service)
+                        .with_upgrades()
+                ).await;
+
+                // Decrement connection count when done
+                conn_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+                match result {
+                    Ok(Err(err)) => {
+                        log::debug!("Connection error: {}", err);
+                    }
+                    Err(_) => {
+                        log::debug!("Connection idle timeout");
+                    }
+                    Ok(Ok(())) => {}
                 }
             });
         }

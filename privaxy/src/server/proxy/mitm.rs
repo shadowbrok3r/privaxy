@@ -9,11 +9,17 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
 use std::net::IpAddr;
+use std::str::FromStr;
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio_rustls::TlsAcceptor;
 
 pub type BoxBodyType = BoxBody<Bytes, hyper::Error>;
+
+// Timeout for TLS handshake and tunnel connections
+const TLS_TIMEOUT: Duration = Duration::from_secs(10);
+const TUNNEL_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes for tunnels
 
 fn empty_body() -> BoxBodyType {
     Empty::<Bytes>::new()
@@ -21,6 +27,25 @@ fn empty_body() -> BoxBodyType {
         .boxed()
 }
 
+/// Extract authority from request - first try URI, then fall back to Host header
+fn extract_authority(req: &Request<Incoming>) -> Option<Authority> {
+    // First, try to get authority from the URI (works for CONNECT and absolute-form requests)
+    if let Some(authority) = req.uri().authority().cloned() {
+        return Some(authority);
+    }
+
+    // For regular HTTP proxy requests, the URI might just be a path.
+    // In this case, we need to get the host from the Host header.
+    if let Some(host_header) = req.headers().get(http::header::HOST) {
+        if let Ok(host_str) = host_header.to_str() {
+            if let Ok(authority) = Authority::from_str(host_str) {
+                return Some(authority);
+            }
+        }
+    }
+
+    None
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_mitm_session(
@@ -33,7 +58,7 @@ pub(crate) async fn serve_mitm_session(
     client_ip_address: IpAddr,
     local_exclusion_store: LocalExclusionStore,
 ) -> Result<Response<BoxBodyType>, hyper::Error> {
-    let authority = match req.uri().authority().cloned() {
+    let authority = match extract_authority(&req) {
         Some(authority) => authority,
         None => {
             let response = Response::builder()
@@ -41,7 +66,11 @@ pub(crate) async fn serve_mitm_session(
                 .body(empty_body())
                 .unwrap();
 
-            log::warn!("Received a request without proper authority, sending bad request");
+            log::warn!(
+                "Received a request without proper authority (URI: {}, Host header: {:?}), sending bad request",
+                req.uri(),
+                req.headers().get(http::header::HOST)
+            );
 
             return Ok(response);
         }
@@ -60,57 +89,71 @@ pub(crate) async fn serve_mitm_session(
         let server_configuration = cert_cache.get(authority.clone()).await.server_configuration;
 
         tokio::task::spawn(async move {
-            match hyper::upgrade::on(req).await {
-                Ok(upgraded) => {
-                    let is_host_blacklisted = local_exclusion_store.contains(authority.host());
-
-                    if is_host_blacklisted {
-                        let mut upgraded = TokioIo::new(upgraded);
-                        let _result = tunnel(&mut upgraded, &authority).await;
-
-                        return;
-                    }
-
-                    match TlsAcceptor::from(server_configuration)
-                        .accept(TokioIo::new(upgraded))
-                        .await
-                    {
-                        Ok(tls_stream) => {
-                            let io = TokioIo::new(tls_stream);
-
-                            let service = service_fn(move |req| {
-                                serve(
-                                    adblock_requester.clone(),
-                                    req,
-                                    client.clone(),
-                                    authority.clone(),
-                                    Scheme::HTTPS,
-                                    broadcast_tx.clone(),
-                                    statistics.clone(),
-                                    client_ip_address,
-                                )
-                            });
-
-                            let _result = http1::Builder::new()
-                                .preserve_header_case(true)
-                                .title_case_headers(true)
-                                .serve_connection(io, service)
-                                .with_upgrades()
-                                .await;
-                        }
-                        // Couldn't perform the tls handshake, they may only support TLS features that we don't or
-                        // make use of untrusted certificates. Let's add them to a blacklist so we'll be able to
-                        // tunnel them instead of trying to perform MITM.
-                        // No blocking will be able to be performed.
-                        Err(error) => {
-                            if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                                log::warn!("Unable to perform handshake for host: {}. Consider excluding it from blocking. The service may not tolerate TLS interception.", authority);
-                            }
-                        }
-                    }
+            let upgraded = match tokio::time::timeout(TLS_TIMEOUT, hyper::upgrade::on(req)).await {
+                Ok(Ok(upgraded)) => upgraded,
+                Ok(Err(e)) => {
+                    log::debug!("Upgrade error: {}", e);
+                    return;
                 }
-                Err(e) => log::error!("upgrade error: {}", e),
+                Err(_) => {
+                    log::debug!("Upgrade timed out for {}", authority);
+                    return;
+                }
+            };
+
+            let is_host_blacklisted = local_exclusion_store.contains(authority.host());
+
+            if is_host_blacklisted {
+                let mut upgraded = TokioIo::new(upgraded);
+                let _ = tokio::time::timeout(
+                    TUNNEL_TIMEOUT,
+                    tunnel(&mut upgraded, &authority)
+                ).await;
+                return;
             }
+
+            let tls_stream = match tokio::time::timeout(
+                TLS_TIMEOUT,
+                TlsAcceptor::from(server_configuration).accept(TokioIo::new(upgraded))
+            ).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                        log::debug!("TLS handshake failed for {}: connection closed", authority);
+                    } else {
+                        log::debug!("TLS handshake failed for {}: {}", authority, error);
+                    }
+                    return;
+                }
+                Err(_) => {
+                    log::debug!("TLS handshake timed out for {}", authority);
+                    return;
+                }
+            };
+
+            let io = TokioIo::new(tls_stream);
+
+            let service = service_fn(move |req| {
+                serve(
+                    adblock_requester.clone(),
+                    req,
+                    client.clone(),
+                    authority.clone(),
+                    Scheme::HTTPS,
+                    broadcast_tx.clone(),
+                    statistics.clone(),
+                    client_ip_address,
+                )
+            });
+
+            let _ = tokio::time::timeout(
+                TUNNEL_TIMEOUT,
+                http1::Builder::new()
+                    .preserve_header_case(true)
+                    .title_case_headers(true)
+                    .serve_connection(io, service)
+                    .with_upgrades()
+            ).await;
         });
 
         Ok(Response::new(empty_body()))
@@ -139,7 +182,7 @@ where
 
     tokio::io::copy_bidirectional(upgraded, &mut server).await?;
 
-    log::debug!("Started tunneling host: {}", authority);
+    log::debug!("Tunnel closed for host: {}", authority);
 
     Ok(())
 }

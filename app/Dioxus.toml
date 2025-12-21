@@ -12,6 +12,8 @@ watch_path = ["src", "assets"]
 [web.resource]
 style = ["assets/styles.css"]
 
+[web.resource.dev]
+
 [desktop]
 resource_dir = "assets"
 

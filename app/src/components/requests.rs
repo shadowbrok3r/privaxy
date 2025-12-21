@@ -1,8 +1,14 @@
 use crate::use_privaxy_server;
 use dioxus::prelude::*;
 use privaxy::events::Event;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_REQUESTS_SHOWN: usize = 500;
+
+// Global signal to persist requests across navigation
+static REQUESTS: GlobalSignal<Vec<RequestEvent>> = Signal::global(Vec::new);
+// Track if we've already started the listener
+static LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 pub struct RequestEvent {
@@ -23,13 +29,16 @@ impl From<Event> for RequestEvent {
     }
 }
 
-#[component]
-pub fn Requests() -> Element {
-    let mut requests = use_signal(Vec::<RequestEvent>::new);
+// Start the global event listener (call this from main layout)
+pub fn start_request_listener() {
+    // Only start once
+    if LISTENER_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
 
-    // Subscribe to events from privaxy server
-    use_effect(move || {
-        spawn(async move {
+    spawn(async move {
+        // Wait for server to be available
+        loop {
             if let Some(server) = use_privaxy_server() {
                 let server = server.read().await;
                 let mut receiver = server.requests_broadcast_sender.subscribe();
@@ -37,13 +46,18 @@ pub fn Requests() -> Element {
 
                 while let Ok(event) = receiver.recv().await {
                     let request_event: RequestEvent = event.into();
-                    requests.write().insert(0, request_event);
-                    requests.write().truncate(MAX_REQUESTS_SHOWN);
+                    REQUESTS.write().insert(0, request_event);
+                    REQUESTS.write().truncate(MAX_REQUESTS_SHOWN);
                 }
+                break;
             }
-        });
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     });
+}
 
+#[component]
+pub fn Requests() -> Element {
     rsx! {
         div { class: "space-y-6",
             // Header
@@ -73,7 +87,7 @@ pub fn Requests() -> Element {
                             }
                         }
                         tbody {
-                            if requests.read().is_empty() {
+                            if REQUESTS.read().is_empty() {
                                 tr {
                                     td {
                                         colspan: "4",
@@ -101,7 +115,7 @@ pub fn Requests() -> Element {
                                     }
                                 }
                             } else {
-                                for (idx, request) in requests.read().iter().enumerate().take(MAX_REQUESTS_SHOWN) {
+                                for (idx, request) in REQUESTS.read().iter().enumerate().take(MAX_REQUESTS_SHOWN) {
                                     tr {
                                         key: "{idx}",
                                         class: if request.is_request_blocked { "blocked" } else { "" },
@@ -136,7 +150,7 @@ pub fn Requests() -> Element {
             }
 
             // Info footer
-            if !requests.read().is_empty() {
+            if !REQUESTS.read().is_empty() {
                 div { class: "text-center text-sm text-stardust",
                     "Showing up to {MAX_REQUESTS_SHOWN} most recent requests"
                 }
