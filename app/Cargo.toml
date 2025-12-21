@@ -1,0 +1,40 @@
+[package]
+name = "privaxy-app"
+version = "0.1.0"
+edition = "2024"
+description = "Privaxy - A privacy-focused ad-blocking proxy"
+authors = ["Privaxy Contributors"]
+license = "MIT"
+
+[dependencies]
+# Dioxus core with desktop and router
+dioxus = { version = "0.7.2", features = ["desktop", "router"] }
+
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Formatting
+num-format = "0.4.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Time utilities
+chrono = { version = "0.4", features = ["serde"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["rustls-tls", "json"] }
+
+# File dialogs (use xdg-portal with tokio)
+rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "tokio"] }
+
+# Privaxy core library
+privaxy = { path = "../privaxy" }
+
+[features]
+default = []

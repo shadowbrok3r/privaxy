@@ -1,16 +1,14 @@
 use crate::blocker::AdblockRequester;
 use crate::events::Event;
 use crate::proxy::exclusions::LocalExclusionStore;
-use hyper::server::conn::AddrStream;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Client, Server};
-use proxy::exclusions;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 use reqwest::redirect::Policy;
-use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 pub mod blocker;
@@ -29,7 +27,7 @@ pub struct PrivaxyServer {
     pub configuration_save_lock: Arc<tokio::sync::Mutex<()>>,
     pub blocking_disabled_store: blocker::BlockingDisabledStore,
     pub statistics: statistics::Statistics,
-    pub local_exclusion_store: exclusions::LocalExclusionStore,
+    pub local_exclusion_store: LocalExclusionStore,
     // A Sender is required to subscribe to broadcasted messages
     pub requests_broadcast_sender: broadcast::Sender<Event>,
 }
@@ -124,57 +122,65 @@ pub async fn start_privaxy() -> PrivaxyServer {
         blocker.handle_requests()
     });
 
-    let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .https_or_http()
-        .enable_http1()
-        .build();
-
-    // The hyper client is only used to perform upgrades. We don't need to
-    // handle compression.
-    // Hyper's client don't follow redirects, which is what we want, nothing to
-    // disable here.
-    let hyper_client = Client::builder().build(https_connector);
-
-    let make_service = make_service_fn(move |conn: &AddrStream| {
-        let client_ip_address = conn.remote_addr().ip();
-
-        let client = client.clone();
-        let hyper_client = hyper_client.clone();
-        let cert_cache = cert_cache.clone();
-        let blocker_requester = blocker_requester.clone();
-        let broadcast_tx = broadcast_tx.clone();
-        let statistics = statistics.clone();
-        let local_exclusion_store = local_exclusion_store.clone();
-
-        async move {
-            Ok::<_, Infallible>(service_fn(move |req| {
-                proxy::serve_mitm_session(
-                    blocker_requester.clone(),
-                    hyper_client.clone(),
-                    client.clone(),
-                    req,
-                    cert_cache.clone(),
-                    broadcast_tx.clone(),
-                    statistics.clone(),
-                    client_ip_address,
-                    local_exclusion_store.clone(),
-                )
-            }))
-        }
-    });
-
     let proxy_server_addr = SocketAddr::from((ip, 8100));
 
-    let server = Server::bind(&proxy_server_addr)
-        .http1_preserve_header_case(true)
-        .http1_title_case_headers(true)
-        .tcp_keepalive(Some(Duration::from_secs(600)))
-        .serve(make_service);
+    // Spawn the proxy server
+    let client_for_server = client.clone();
+    let cert_cache_for_server = cert_cache.clone();
+    let broadcast_tx_for_server = broadcast_tx.clone();
+    let statistics_for_server = statistics.clone();
+    let blocker_requester_for_server = blocker_requester.clone();
+    let local_exclusion_store_for_server = local_exclusion_store.clone();
 
-    tokio::spawn(server);
+    tokio::spawn(async move {
+        let listener = TcpListener::bind(proxy_server_addr).await.unwrap();
+        log::info!("Proxy available at http://{}", proxy_server_addr);
 
-    log::info!("Proxy available at http://{}", proxy_server_addr);
+        loop {
+            let (stream, client_addr) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    log::error!("Failed to accept connection: {}", e);
+                    continue;
+                }
+            };
+
+            let client_ip_address = client_addr.ip();
+            let io = TokioIo::new(stream);
+
+            let client = client_for_server.clone();
+            let cert_cache = cert_cache_for_server.clone();
+            let broadcast_tx = broadcast_tx_for_server.clone();
+            let statistics = statistics_for_server.clone();
+            let blocker_requester = blocker_requester_for_server.clone();
+            let local_exclusion_store = local_exclusion_store_for_server.clone();
+
+            tokio::spawn(async move {
+                let service = service_fn(move |req| {
+                    proxy::serve_mitm_session(
+                        blocker_requester.clone(),
+                        client.clone(),
+                        req,
+                        cert_cache.clone(),
+                        broadcast_tx.clone(),
+                        statistics.clone(),
+                        client_ip_address,
+                        local_exclusion_store.clone(),
+                    )
+                });
+
+                if let Err(err) = http1::Builder::new()
+                    .preserve_header_case(true)
+                    .title_case_headers(true)
+                    .serve_connection(io, service)
+                    .with_upgrades()
+                    .await
+                {
+                    log::debug!("Connection error: {}", err);
+                }
+            });
+        }
+    });
 
     PrivaxyServer {
         ca_certificate_pem,

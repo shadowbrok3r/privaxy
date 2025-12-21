@@ -27,7 +27,7 @@ const FILTERS_UPDATE_AFTER: Duration = Duration::from_secs(60 * 10);
 type ConfigurationResult<T> = Result<T, ConfigurationError>;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-enum FilterGroup {
+pub enum FilterGroup {
     Default,
     Regional,
     Ads,
@@ -46,10 +46,10 @@ pub struct DefaultFilter {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Filter {
-    enabled: bool,
-    title: String,
-    group: FilterGroup,
-    file_name: String,
+    pub enabled: bool,
+    pub title: String,
+    pub group: FilterGroup,
+    pub file_name: String,
 }
 
 impl Filter {

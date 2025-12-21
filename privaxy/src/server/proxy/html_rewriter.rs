@@ -1,30 +1,19 @@
 use crate::{blocker::AdblockRequester, statistics::Statistics};
+use bytes::Bytes;
 use crossbeam_channel::Receiver;
-use hyper::body::Bytes;
+use hyper::body::Frame;
 use lol_html::{element, HtmlRewriter, Settings};
 use regex::Regex;
 use std::collections::HashSet;
 use std::fmt::Write;
-use tokio::sync;
-
-type InternalBodyChannel = (
-    sync::mpsc::UnboundedSender<(Bytes, Option<AdblockProperties>)>,
-    sync::mpsc::UnboundedReceiver<(Bytes, Option<AdblockProperties>)>,
-);
-
-struct AdblockProperties {
-    url: String,
-    ids: HashSet<String>,
-    classes: HashSet<String>,
-}
+use tokio::sync::mpsc::Sender;
 
 pub struct Rewriter {
     url: String,
     adblock_requester: AdblockRequester,
     receiver: Receiver<Bytes>,
-    body_sender: hyper::body::Sender,
+    body_sender: Sender<Result<Frame<Bytes>, hyper::Error>>,
     statistics: Statistics,
-    internal_body_channel: InternalBodyChannel,
 }
 
 impl Rewriter {
@@ -32,7 +21,7 @@ impl Rewriter {
         url: String,
         adblock_requester: AdblockRequester,
         receiver: Receiver<Bytes>,
-        body_sender: hyper::body::Sender,
+        body_sender: Sender<Result<Frame<Bytes>, hyper::Error>>,
         statistics: Statistics,
     ) -> Self {
         Self {
@@ -41,26 +30,20 @@ impl Rewriter {
             statistics,
             adblock_requester,
             receiver,
-            internal_body_channel: sync::mpsc::unbounded_channel(),
         }
     }
 
     pub(crate) fn rewrite(self) {
-        let (internal_body_sender, internal_body_receiver) = self.internal_body_channel;
         let body_sender = self.body_sender;
         let adblock_requester = self.adblock_requester.clone();
         let statistics = self.statistics.clone();
+        let url = self.url.clone();
 
         let mut classes = HashSet::new();
         let mut ids = HashSet::new();
 
-        tokio::spawn(Self::write_body(
-            internal_body_receiver,
-            body_sender,
-            adblock_requester,
-            statistics,
-        ));
-
+        let body_sender_clone = body_sender.clone();
+        
         let mut rewriter = HtmlRewriter::new(
             Settings {
                 element_content_handlers: vec![
@@ -90,134 +73,124 @@ impl Rewriter {
 
                         Ok(())
                     }),
-                    // Let's discard of end html and body tag
-                    // to inject style and scripts before the implicit
-                    // close.
-                    element!("html, body", |element| {
-                        element
-                            .on_end_tag(|end| {
-                                end.remove();
-                                Ok(())
-                            })
-                            .unwrap();
-
-                        Ok(())
-                    }),
                 ],
                 ..Settings::default()
             },
-            |c: &[u8]| {
-                let _result = internal_body_sender.send((Bytes::copy_from_slice(c), None));
+            move |c: &[u8]| {
+                let _ = body_sender_clone.blocking_send(Ok(Frame::data(Bytes::copy_from_slice(c))));
             },
         );
 
         for message in self.receiver {
-            rewriter.write(&message).unwrap();
-        }
-        rewriter.end().unwrap();
-
-        let _result = internal_body_sender.send((
-            Bytes::new(),
-            Some(AdblockProperties {
-                ids,
-                classes,
-                url: self.url,
-            }),
-        ));
-    }
-
-    async fn write_body(
-        mut receiver: sync::mpsc::UnboundedReceiver<(Bytes, Option<AdblockProperties>)>,
-        mut body_sender: hyper::body::Sender,
-        adblock_requester: AdblockRequester,
-        statistics: Statistics,
-    ) {
-        while let Some((bytes, adblock_properties)) = receiver.recv().await {
-            if let Err(_err) = body_sender.send_data(bytes).await {
+            if rewriter.write(&message).is_err() {
                 break;
             }
-            if let Some(adblock_properties) = adblock_properties {
-                let mut response_has_been_modified = false;
+        }
+        let _ = rewriter.end();
 
-                let blocker_result = adblock_requester
-                    .get_cosmetic_response(
-                        adblock_properties.url,
-                        Vec::from_iter(adblock_properties.ids.into_iter()),
-                        Vec::from_iter(adblock_properties.classes.into_iter()),
-                    )
-                    .await;
+        // Now inject the cosmetic filters
+        let rt = tokio::runtime::Handle::try_current();
+        if let Ok(handle) = rt {
+            let body_sender_final = body_sender.clone();
+            let _ = handle.block_on(async {
+                Self::inject_cosmetics(
+                    url,
+                    ids,
+                    classes,
+                    adblock_requester,
+                    statistics,
+                    body_sender_final,
+                )
+                .await
+            });
+        }
+    }
 
-                let mut to_append_to_response = format!(
-                    r#"
+    async fn inject_cosmetics(
+        url: String,
+        ids: HashSet<String>,
+        classes: HashSet<String>,
+        adblock_requester: AdblockRequester,
+        statistics: Statistics,
+        body_sender: Sender<Result<Frame<Bytes>, hyper::Error>>,
+    ) {
+        let mut response_has_been_modified = false;
+
+        let blocker_result = adblock_requester
+            .get_cosmetic_response(
+                url,
+                Vec::from_iter(ids.into_iter()),
+                Vec::from_iter(classes.into_iter()),
+            )
+            .await;
+
+        let mut to_append_to_response = format!(
+            r#"
 <!-- privaxy proxy -->
 <style>{hidden_selectors}
 {style_selectors}
 </style>
 <!-- privaxy proxy -->"#,
-                    hidden_selectors = {
-                        // We insert one `display: none !important;` entry per selector
-                        // as otherwise, a single malformed selector would be breaking blocking.
-                        blocker_result
-                            .hidden_selectors
-                            .into_iter()
-                            .map(|selector| {
-                                format!(
-                                    r#"
-                                {}
-                                {{
-                                    display: none !important;
-                                }}
-                        "#,
-                                    selector
-                                )
-                            })
-                            .collect::<String>()
-                    },
-                    style_selectors = {
-                        let style_selectors = blocker_result.style_selectors;
+            hidden_selectors = {
+                // We insert one `display: none !important;` entry per selector
+                // as otherwise, a single malformed selector would be breaking blocking.
+                blocker_result
+                    .hidden_selectors
+                    .into_iter()
+                    .map(|selector| {
+                        format!(
+                            r#"
+                            {}
+                            {{
+                                display: none !important;
+                            }}
+                    "#,
+                            selector
+                        )
+                    })
+                    .collect::<String>()
+            },
+            style_selectors = {
+                let style_selectors = blocker_result.style_selectors;
 
-                        if !style_selectors.is_empty() {
-                            response_has_been_modified = true
-                        }
+                if !style_selectors.is_empty() {
+                    response_has_been_modified = true
+                }
 
-                        style_selectors
-                            .into_iter()
-                            .map(|(selector, content)| {
-                                format!(
-                                    "{selector} {{ {content} }}",
-                                    selector = selector,
-                                    content = content.join(";")
-                                )
-                            })
-                            .collect::<String>()
-                    }
-                );
+                style_selectors
+                    .into_iter()
+                    .map(|(selector, content)| {
+                        format!(
+                            "{selector} {{ {content} }}",
+                            selector = selector,
+                            content = content.join(";")
+                        )
+                    })
+                    .collect::<String>()
+            }
+        );
 
-                if let Some(injected_script) = blocker_result.injected_script {
-                    response_has_been_modified = true;
+        if let Some(injected_script) = blocker_result.injected_script {
+            response_has_been_modified = true;
 
-                    write!(
-                        to_append_to_response,
-                        r#"
+            write!(
+                to_append_to_response,
+                r#"
 <!-- Privaxy proxy -->
 <script type="application/javascript">{}</script>
 <!-- privaxy proxy -->
 "#,
-                        injected_script
-                    )
-                    .unwrap();
-                }
-
-                if response_has_been_modified {
-                    statistics.increment_modified_responses();
-                }
-
-                let bytes = Bytes::copy_from_slice(&to_append_to_response.into_bytes());
-
-                if let Err(_err) = body_sender.send_data(bytes).await {
-                    break;
-                }
-            }
+                injected_script
+            )
+            .unwrap();
         }
+
+        if response_has_been_modified {
+            statistics.increment_modified_responses();
+        }
+
+        let _ = body_sender
+            .send(Ok(Frame::data(Bytes::from(to_append_to_response))))
+            .await;
     }
 }

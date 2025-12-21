@@ -1,32 +1,45 @@
 use super::{exclusions::LocalExclusionStore, serve::serve};
 use crate::{blocker::AdblockRequester, cert::CertCache, events::Event, statistics::Statistics};
+use bytes::Bytes;
 use http::uri::{Authority, Scheme};
-use hyper::{
-    client::HttpConnector, http, server::conn::Http, service::service_fn, upgrade::Upgraded, Body,
-    Method, Request, Response,
-};
-use hyper_rustls::HttpsConnector;
-use std::{net::IpAddr, sync::Arc};
-use tokio::{net::TcpStream, sync::broadcast};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response};
+use hyper_util::rt::TokioIo;
+use std::net::IpAddr;
+use tokio::net::TcpStream;
+use tokio::sync::broadcast;
 use tokio_rustls::TlsAcceptor;
+
+pub type BoxBodyType = BoxBody<Bytes, hyper::Error>;
+
+fn empty_body() -> BoxBodyType {
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed()
+}
+
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_mitm_session(
     adblock_requester: AdblockRequester,
-    hyper_client: hyper::Client<HttpsConnector<HttpConnector>>,
     client: reqwest::Client,
-    req: Request<Body>,
+    req: Request<Incoming>,
     cert_cache: CertCache,
     broadcast_tx: broadcast::Sender<Event>,
     statistics: Statistics,
     client_ip_address: IpAddr,
     local_exclusion_store: LocalExclusionStore,
-) -> Result<Response<Body>, hyper::Error> {
+) -> Result<Response<BoxBodyType>, hyper::Error> {
     let authority = match req.uri().authority().cloned() {
         Some(authority) => authority,
         None => {
-            let mut response = Response::new(Body::empty());
-            *response.status_mut() = http::StatusCode::BAD_REQUEST;
+            let response = Response::builder()
+                .status(http::StatusCode::BAD_REQUEST)
+                .body(empty_body())
+                .unwrap();
 
             log::warn!("Received a request without proper authority, sending bad request");
 
@@ -44,44 +57,44 @@ pub(crate) async fn serve_mitm_session(
         //
         // When HTTP method is CONNECT we should return an empty body
         // then we can eventually upgrade the connection and talk a new protocol.
-        let server_configuration =
-            Arc::new(cert_cache.get(authority.clone()).await.server_configuration);
+        let server_configuration = cert_cache.get(authority.clone()).await.server_configuration;
 
         tokio::task::spawn(async move {
             match hyper::upgrade::on(req).await {
-                Ok(mut upgraded) => {
+                Ok(upgraded) => {
                     let is_host_blacklisted = local_exclusion_store.contains(authority.host());
 
                     if is_host_blacklisted {
+                        let mut upgraded = TokioIo::new(upgraded);
                         let _result = tunnel(&mut upgraded, &authority).await;
 
                         return;
                     }
 
-                    let http = Http::new();
-
                     match TlsAcceptor::from(server_configuration)
-                        .accept(upgraded)
+                        .accept(TokioIo::new(upgraded))
                         .await
                     {
                         Ok(tls_stream) => {
-                            let _result = http
-                                .serve_connection(
-                                    tls_stream,
-                                    service_fn(move |req| {
-                                        serve(
-                                            adblock_requester.clone(),
-                                            req,
-                                            hyper_client.clone(),
-                                            client.clone(),
-                                            authority.clone(),
-                                            Scheme::HTTPS,
-                                            broadcast_tx.clone(),
-                                            statistics.clone(),
-                                            client_ip_address,
-                                        )
-                                    }),
+                            let io = TokioIo::new(tls_stream);
+
+                            let service = service_fn(move |req| {
+                                serve(
+                                    adblock_requester.clone(),
+                                    req,
+                                    client.clone(),
+                                    authority.clone(),
+                                    Scheme::HTTPS,
+                                    broadcast_tx.clone(),
+                                    statistics.clone(),
+                                    client_ip_address,
                                 )
+                            });
+
+                            let _result = http1::Builder::new()
+                                .preserve_header_case(true)
+                                .title_case_headers(true)
+                                .serve_connection(io, service)
                                 .with_upgrades()
                                 .await;
                         }
@@ -100,14 +113,13 @@ pub(crate) async fn serve_mitm_session(
             }
         });
 
-        Ok(Response::new(Body::empty()))
+        Ok(Response::new(empty_body()))
     } else {
         // The request is not of method `CONNECT`. Therefore,
         // this request is for an HTTP resource.
         serve(
             adblock_requester,
             req,
-            hyper_client.clone(),
             client.clone(),
             authority,
             Scheme::HTTP,
@@ -119,10 +131,13 @@ pub(crate) async fn serve_mitm_session(
     }
 }
 
-async fn tunnel(mut upgraded: &mut Upgraded, authority: &Authority) -> std::io::Result<()> {
+async fn tunnel<T>(upgraded: &mut T, authority: &Authority) -> std::io::Result<()>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let mut server = TcpStream::connect(authority.to_string()).await?;
 
-    tokio::io::copy_bidirectional(&mut upgraded, &mut server).await?;
+    tokio::io::copy_bidirectional(upgraded, &mut server).await?;
 
     log::debug!("Started tunneling host: {}", authority);
 

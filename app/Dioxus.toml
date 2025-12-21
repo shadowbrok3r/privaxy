@@ -1,0 +1,24 @@
+[application]
+name = "privaxy"
+default_platform = "desktop"
+
+[web.app]
+title = "Privaxy"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src", "assets"]
+
+[web.resource]
+style = ["assets/styles.css"]
+
+[desktop]
+resource_dir = "assets"
+
+[[desktop.window]]
+title = "Privaxy"
+width = 1200
+height = 800
+resizable = true
+decorations = true
+

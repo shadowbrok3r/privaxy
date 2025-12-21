@@ -3,7 +3,8 @@ use crate::blocker_utils::{
 };
 use adblock::blocker::BlockerResult as AdblockerBlockerResult;
 use adblock::engine::Engine;
-use adblock::lists::FilterSet;
+use adblock::lists::{FilterSet, ParseOptions};
+use adblock::request::Request;
 use adblock::resources::Resource;
 use crossbeam_channel::{Receiver, Sender};
 use include_dir::{include_dir, Dir};
@@ -100,16 +101,21 @@ lazy_static! {
         resources
     };
 }
+
 impl Blocker {
     pub fn new(
         sender: Sender<BlockerRequest>,
         receiver: Receiver<BlockerRequest>,
         blocking_disabled: BlockingDisabledStore,
     ) -> Self {
+        // Create an empty engine initially
+        let filter_set = FilterSet::new(true);
+        let engine = Engine::from_filter_set(filter_set, true);
+
         Self {
             sender,
             receiver,
-            engine: Engine::new(true),
+            engine,
             blocking_disabled,
         }
     }
@@ -159,7 +165,8 @@ impl Blocker {
                             .respond_to
                             .send(BlockerResult::Cosmetic(CosmeticBlockerResult {
                                 hidden_selectors,
-                                style_selectors: url_specific_resources.style_selectors,
+                                // style_selectors removed in newer adblock versions
+                                style_selectors: HashMap::new(),
                                 injected_script,
                             }));
                 }
@@ -172,7 +179,6 @@ impl Blocker {
                                 redirect: None,
                                 exception: None,
                                 filter: None,
-                                error: None,
                                 rewritten_url: None,
                             },
                         ));
@@ -180,11 +186,24 @@ impl Blocker {
                         continue;
                     }
 
-                    let blocker_result = self.engine.check_network_urls(
-                        network_url.url.as_str(),
-                        network_url.referer.as_str(),
+                    // Create a Request object for the adblock engine
+                    let adblock_request = Request::new(
+                        &network_url.url,
+                        &network_url.referer,
                         "other",
                     );
+
+                    let blocker_result = match adblock_request {
+                        Ok(req) => self.engine.check_network_request(&req),
+                        Err(_) => AdblockerBlockerResult {
+                            matched: false,
+                            important: false,
+                            redirect: None,
+                            exception: None,
+                            filter: None,
+                            rewritten_url: None,
+                        },
+                    };
 
                     let _result = request
                         .respond_to
@@ -196,12 +215,11 @@ impl Blocker {
                     let mut filter_set = FilterSet::new(true);
 
                     for filter in filters {
-                        filter_set
-                            .add_filter_list(&filter, adblock::lists::ParseOptions::default());
+                        filter_set.add_filter_list(&filter, ParseOptions::default());
                     }
 
                     let mut adblock_engine = Engine::from_filter_set(filter_set, true);
-                    adblock_engine.use_resources(&ADBLOCKING_RESOURCES);
+                    adblock_engine.use_resources(ADBLOCKING_RESOURCES.iter().cloned());
 
                     self.engine = adblock_engine;
                 }

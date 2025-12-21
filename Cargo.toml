@@ -1,17 +1,12 @@
 [workspace]
-members = ["web_frontend", "privaxy", "src-tauri"]
+resolver = "2"
+members = ["app", "privaxy"]
+# Note: "privaxy" library needs dependency updates before it can be included
+# Legacy crates (to be removed): "web_frontend", "src-tauri"
 
 [profile.release]
 lto = true
 
-[profile.release.package.privaxy]
+[profile.release.package.privaxy-app]
 codegen-units = 1
 opt-level = 3
-
-[profile.release.package.privaxy_app]
-codegen-units = 1
-opt-level = 3
-
-[profile.release.package.web_frontend]
-codegen-units = 1
-opt-level = 's'

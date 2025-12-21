@@ -13,7 +13,8 @@ use openssl::{
         X509NameBuilder, X509Ref, X509Req, X509ReqBuilder, X509,
     },
 };
-use rustls::{Certificate, PrivateKey, ServerConfig};
+use rustls::ServerConfig;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::{str::FromStr, sync::Arc};
 use tokio::sync::Mutex;
 use uluru::LRUCache;
@@ -23,7 +24,7 @@ const MAX_CACHED_CERTIFICATES: usize = 1_000;
 #[derive(Clone)]
 pub struct SignedWithCaCert {
     authority: Authority,
-    pub server_configuration: ServerConfig,
+    pub server_configuration: Arc<ServerConfig>,
 }
 
 impl SignedWithCaCert {
@@ -36,23 +37,25 @@ impl SignedWithCaCert {
         let x509 =
             Self::build_ca_signed_cert(&ca_certificate, &ca_private_key, &authority, &private_key);
 
-        let certs = vec![
-            Certificate(x509.to_der().unwrap()),
-            Certificate(ca_certificate.to_der().unwrap()),
+        let cert_der = x509.to_der().unwrap();
+        let ca_cert_der = ca_certificate.to_der().unwrap();
+        let key_der = private_key.private_key_to_der().unwrap();
+
+        let certs: Vec<CertificateDer<'static>> = vec![
+            CertificateDer::from(cert_der),
+            CertificateDer::from(ca_cert_der),
         ];
 
+        let private_key = PrivateKeyDer::try_from(key_der).unwrap();
+
         let server_configuration = ServerConfig::builder()
-            .with_safe_default_cipher_suites()
-            .with_safe_default_kx_groups()
-            .with_safe_default_protocol_versions()
-            .unwrap()
             .with_no_client_auth()
-            .with_single_cert(certs, PrivateKey(private_key.private_key_to_der().unwrap()))
+            .with_single_cert(certs, private_key)
             .unwrap();
 
         Self {
             authority,
-            server_configuration,
+            server_configuration: Arc::new(server_configuration),
         }
     }
 

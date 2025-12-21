@@ -6,7 +6,11 @@ const RUST_LOG_ENV_KEY: &str = "RUST_LOG";
 #[tokio::main]
 async fn main() {
     if std::env::var(RUST_LOG_ENV_KEY).is_err() {
-        std::env::set_var(RUST_LOG_ENV_KEY, "privaxy=info");
+        // SAFETY: We're setting this env var before any threads are spawned,
+        // at the very start of main. This is safe as there's no concurrent access.
+        unsafe {
+            std::env::set_var(RUST_LOG_ENV_KEY, "privaxy=info");
+        }
     }
 
     env_logger::init();
