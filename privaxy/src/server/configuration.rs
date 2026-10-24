@@ -2,13 +2,14 @@ use crate::{
     blocker::AdblockRequester, ca::make_ca_certificate, proxy::exclusions::LocalExclusionStore,
 };
 use dirs::home_dir;
-use futures::future::{try_join_all, AbortHandle, Abortable};
+use futures::future::{AbortHandle, Abortable, try_join_all};
 use openssl::{
     pkey::{PKey, Private},
     x509::X509,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::{collections::BTreeSet, time::Duration};
 use thiserror::Error;
 use tokio::sync::{self, mpsc::Sender};
@@ -141,31 +142,28 @@ impl Configuration {
     pub async fn read_from_home(http_client: reqwest::Client) -> ConfigurationResult<Self> {
         let home_directory = get_home_directory()?;
         let configuration_directory = home_directory.join(CONFIGURATION_DIRECTORY_NAME);
+        Self::read_from_directory(&configuration_directory, Self::new_default(http_client)).await
+    }
+
+    async fn read_from_directory(
+        configuration_directory: &Path,
+        new_default: impl Future<Output = ConfigurationResult<Self>>,
+    ) -> ConfigurationResult<Self> {
         let configuration_file_path = configuration_directory.join(CONFIGURATION_FILE_NAME);
 
-        if let Err(err) = fs::metadata(&configuration_directory).await {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                log::debug!("Configuration directory not found, creating one");
-
-                fs::create_dir(&configuration_directory).await?;
-
-                let configuration = Self::new_default(http_client).await?;
-                configuration.save().await?;
-
-                return Ok(configuration);
-            } else {
-                return Err(ConfigurationError::FileSystemError(err));
-            }
-        };
+        // Pairing initialization also creates this directory during desktop startup.
+        // Accept an existing directory without a separate check that can race.
+        fs::create_dir_all(configuration_directory).await?;
 
         match fs::read(&configuration_file_path).await {
             Ok(bytes) => Ok(toml::from_slice(&bytes)?),
             Err(err) => {
-                log::debug!("Configuration file not found, creating one");
-
                 if err.kind() == std::io::ErrorKind::NotFound {
-                    let configuration = Self::new_default(http_client).await?;
-                    configuration.save().await?;
+                    log::debug!("Configuration file not found, creating one");
+                    let configuration = new_default.await?;
+                    configuration
+                        .save_to_directory(configuration_directory)
+                        .await?;
 
                     Ok(configuration)
                 } else {
@@ -178,6 +176,10 @@ impl Configuration {
     pub async fn save(&self) -> ConfigurationResult<()> {
         let home_directory = get_home_directory()?;
         let configuration_directory = home_directory.join(CONFIGURATION_DIRECTORY_NAME);
+        self.save_to_directory(&configuration_directory).await
+    }
+
+    async fn save_to_directory(&self, configuration_directory: &Path) -> ConfigurationResult<()> {
         let configuration_file_path = configuration_directory.join(CONFIGURATION_FILE_NAME);
 
         let configuration_serialized = toml::to_string_pretty(&self).unwrap();
@@ -456,4 +458,113 @@ async fn get_filters_content(
     filters.append(&mut configuration.custom_filters.clone());
 
     filters
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::ready;
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    fn configuration() -> Configuration {
+        Configuration {
+            exclusions: BTreeSet::from(["trusted.example".into()]),
+            custom_filters: vec!["||ads.example^".into()],
+            ca: Ca {
+                ca_certificate: "existing certificate".into(),
+                ca_private_key: "existing private key".into(),
+            },
+            filters: Vec::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pairing_and_configuration_can_initialize_together() {
+        let root = tempfile::tempdir().unwrap();
+        let expected = configuration();
+
+        // Exercise both startup actors together without sleeps or changing HOME.
+        for attempt in 0..64 {
+            let directory = root.path().join(attempt.to_string());
+            let pairing_directory = directory.clone();
+            let barrier = Arc::new(Barrier::new(2));
+            let pairing_barrier = barrier.clone();
+            let pairing = tokio::spawn(async move {
+                pairing_barrier.wait().await;
+                fs::create_dir_all(&pairing_directory).await.unwrap();
+                fs::write(
+                    pairing_directory.join("desktop-pairing.json"),
+                    b"paired identity",
+                )
+                .await
+                .unwrap();
+            });
+
+            barrier.wait().await;
+            let loaded =
+                Configuration::read_from_directory(&directory, ready(Ok(expected.clone()))).await;
+            pairing.await.unwrap();
+            assert_eq!(loaded.unwrap(), expected);
+            let saved = fs::read(directory.join(CONFIGURATION_FILE_NAME))
+                .await
+                .unwrap();
+            assert_eq!(toml::from_slice::<Configuration>(&saved).unwrap(), expected);
+            assert_eq!(
+                fs::read(directory.join("desktop-pairing.json"))
+                    .await
+                    .unwrap(),
+                b"paired identity"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_configuration_is_preserved_without_generating_a_new_ca() {
+        let root = tempfile::tempdir().unwrap();
+        let expected = configuration();
+        expected.save_to_directory(root.path()).await.unwrap();
+        let path = root.path().join(CONFIGURATION_FILE_NAME);
+        let original = fs::read(&path).await.unwrap();
+        let loaded = Configuration::read_from_directory(root.path(), async {
+            panic!("Existing settings must not generate a new configuration or CA")
+        })
+        .await
+        .unwrap();
+        assert_eq!(loaded, expected);
+        assert_eq!(fs::read(path).await.unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn invalid_configuration_is_reported_without_overwriting_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(CONFIGURATION_FILE_NAME);
+        let invalid = b"not valid TOML";
+        fs::write(&path, invalid).await.unwrap();
+        let result = Configuration::read_from_directory(root.path(), async {
+            panic!("An invalid configuration must not be replaced")
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(ConfigurationError::DeserializeError(_))
+        ));
+        assert_eq!(fs::read(path).await.unwrap(), invalid);
+    }
+
+    #[tokio::test]
+    async fn configuration_directory_collision_is_reported_without_overwriting() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(CONFIGURATION_DIRECTORY_NAME);
+        fs::write(&path, b"unrelated file").await.unwrap();
+        let result = Configuration::read_from_directory(&path, async {
+            panic!("A file at the configuration directory must not be replaced")
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(ConfigurationError::FileSystemError(_))
+        ));
+        assert_eq!(fs::read(path).await.unwrap(), b"unrelated file");
+    }
 }

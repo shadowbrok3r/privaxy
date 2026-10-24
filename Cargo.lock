@@ -5310,6 +5310,7 @@ dependencies = [
  "serde",
  "serde-tuple-vec-map",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
