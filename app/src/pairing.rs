@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    net::{Ipv4Addr, SocketAddrV4},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+pub const LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8101);
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Identity {
@@ -52,19 +55,36 @@ impl Identity {
             .map_err(|e| e.to_string())?;
         Ok(identity)
     }
-    pub fn code(&self, host: &str) -> String {
+    pub fn code(&self, host: &str) -> Result<String, &'static str> {
         use base64::Engine as _;
-        let json = serde_json::json!({"version":1,"host":host,"port":8101,"token":self.token,"certificate_pem":self.certificate_pem}).to_string();
-        format!(
+        let host = host.trim();
+        if host.is_empty()
+            || host.contains(['/', '\\', ':', '@', '?', '#'])
+            || host.chars().any(char::is_whitespace)
+        {
+            return Err("Enter the desktop's IPv4 address or hostname, without a port.");
+        }
+        if host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+            || host.parse::<Ipv4Addr>().is_ok_and(|ip| {
+                ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast()
+            })
+        {
+            return Err(
+                "Android needs this computer's IP address; 0.0.0.0 is only a listening address.",
+            );
+        }
+        let json = serde_json::json!({"version":1,"host":host,"port":LISTEN_ADDRESS.port(),"token":self.token,"certificate_pem":self.certificate_pem}).to_string();
+        Ok(format!(
             "privaxy-pair-v1:{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
-        )
+        ))
     }
     pub async fn serve(self, status: Arc<Mutex<String>>) -> Result<(), String> {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:8101")
+        let listener = tokio::net::TcpListener::bind(LISTEN_ADDRESS)
             .await
             .map_err(|e| e.to_string())?;
-        *status.lock().unwrap() = "Listening on port 8101 (encrypted, paired clients only)".into();
+        *status.lock().unwrap() =
+            format!("Listening on {LISTEN_ADDRESS} (encrypted, paired clients only)");
         self.serve_on(listener, "127.0.0.1:8100".parse().unwrap())
             .await
     }
@@ -74,7 +94,10 @@ impl Identity {
         upstream: std::net::SocketAddr,
     ) -> Result<(), String> {
         if self.token.len() != 64 || !self.token.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("Stored pairing credentials are invalid; revoke pairings to regenerate them.".into());
+            return Err(
+                "Stored pairing credentials are invalid; revoke pairings to regenerate them."
+                    .into(),
+            );
         }
         let config = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -124,6 +147,41 @@ impl Identity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairing_code_uses_selected_address_and_relay_port() {
+        use base64::Engine as _;
+        let identity = Identity {
+            token: "a".repeat(64),
+            certificate_pem: "test certificate".into(),
+            cert: Vec::new(),
+            key: Vec::new(),
+        };
+        for host in ["100.64.0.5", "192.168.1.10", "desktop.example"] {
+            let code = identity.code(&format!(" {host} ")).unwrap();
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(code.strip_prefix("privaxy-pair-v1:").unwrap())
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(payload["host"], host);
+            assert_eq!(payload["port"], 8101);
+        }
+        for host in [
+            "",
+            "0.0.0.0",
+            "127.0.0.1",
+            "localhost",
+            "::",
+            "192.168.1.10:8100",
+            "http://desktop.example",
+        ] {
+            assert!(
+                identity.code(host).is_err(),
+                "Unexpected pairing code for {host}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn paired_tls_relay_transfers_bytes_rejects_bad_tokens_and_revokes_open_streams() {
         let _ = rustls::crypto::ring::default_provider().install_default();

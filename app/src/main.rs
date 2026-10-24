@@ -1,6 +1,7 @@
 use eframe::egui;
 use egui_theme_kit::{chrome, picker, store::JsonDirStore, title_bar::TitleBar};
 use std::sync::{Arc, Mutex};
+mod network;
 mod pairing;
 
 struct App {
@@ -21,6 +22,7 @@ struct App {
     relay: Option<tokio::task::JoinHandle<()>>,
     relay_status: Arc<Mutex<String>>,
     host: String,
+    addresses: network::Addresses,
     notice: Arc<Mutex<String>>,
 }
 impl App {
@@ -60,6 +62,8 @@ impl App {
         });
         let identity = pairing::Identity::load();
         let notice = identity.as_ref().err().cloned().unwrap_or_default();
+        let addresses = network::Addresses::detect();
+        let host = addresses.preferred_host();
         Self {
             ctx: cc.egui_ctx.clone(),
             runtime,
@@ -77,7 +81,8 @@ impl App {
             identity: identity.ok(),
             relay: None,
             relay_status: Arc::new(Mutex::new("Disabled".into())),
-            host: "".into(),
+            host,
+            addresses,
             notice: Arc::new(Mutex::new(notice)),
         }
     }
@@ -177,11 +182,61 @@ impl App {
                 *self.config.lock().unwrap() = cfg;
             }
             4 => {
+                egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Pair Android");
-                ui.label(
-                    "Enter this computer's LAN address. Android remembers the encrypted pairing.",
-                );
-                ui.text_edit_singleline(&mut self.host);
+                ui.label(format!(
+                    "Relay listens on {} (all network interfaces).",
+                    pairing::LISTEN_ADDRESS
+                ));
+                ui.label("Choose the desktop address Android should use. Tailscale is preferred when available.");
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(ip) = self.addresses.tailscale {
+                        let address = ip.to_string();
+                        if ui
+                            .selectable_label(
+                                self.host.trim() == address,
+                                format!("Tailscale: {address}"),
+                            )
+                            .clicked()
+                        {
+                            self.host = address;
+                        }
+                    } else if self.addresses.tailscale_installed {
+                        ui.label(
+                            "Tailscale: no active IPv4 address. Start Tailscale, then refresh.",
+                        );
+                    }
+                    if let Some(ip) = self.addresses.lan {
+                        let address = ip.to_string();
+                        if ui
+                            .selectable_label(
+                                self.host.trim() == address,
+                                format!("LAN: {address}"),
+                            )
+                            .clicked()
+                        {
+                            self.host = address;
+                        }
+                    } else {
+                        ui.label("LAN: no active IPv4 address found.");
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.host)
+                            .hint_text("Desktop IPv4 address or hostname"),
+                    );
+                    if ui.button("Refresh addresses").clicked() {
+                        self.addresses = network::Addresses::detect();
+                        let preferred = self.addresses.preferred_host();
+                        if !preferred.is_empty() {
+                            self.host = preferred;
+                        }
+                    }
+                });
+                if self.addresses.tailscale.is_some_and(|ip| self.host.trim() == ip.to_string()) {
+                    ui.label("Android allows one VPN at a time. For full-device capture, choose LAN unless your network already routes to Tailscale.");
+                }
                 if self.relay.is_none() {
                     if ui
                         .add_enabled(
@@ -204,41 +259,50 @@ impl App {
                 }
                 ui.label(self.relay_status.lock().unwrap().clone());
                 if let Some(identity) = &self.identity {
-                    if !self.host.trim().is_empty() {
-                        let code = identity.code(self.host.trim());
-                        if ui.button("Copy pairing code").clicked() {
-                            ui.ctx().copy_text(code.clone());
-                        }
-                        ui.label("Paste into Android Settings → Desktop pairing. Install the desktop inspection CA from Settings.");
-                        if let Ok(qr) = qrcode::QrCode::new(code.as_bytes()) {
-                            let quiet = 4;
-                            let modules = qr.width() + quiet * 2;
-                            let scale = (ui.available_width().min(420.) / modules as f32)
-                                .floor()
-                                .max(1.);
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(modules as f32 * scale, modules as f32 * scale),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().rect_filled(rect, 0, egui::Color32::WHITE);
-                            for y in 0..qr.width() {
-                                for x in 0..qr.width() {
-                                    if qr[(x, y)] == qrcode::Color::Dark {
-                                        ui.painter().rect_filled(
-                                            egui::Rect::from_min_size(
-                                                rect.min
-                                                    + egui::vec2(
-                                                        (x + quiet) as f32 * scale,
-                                                        (y + quiet) as f32 * scale,
-                                                    ),
-                                                egui::vec2(scale, scale),
-                                            ),
-                                            0,
-                                            egui::Color32::BLACK,
-                                        );
+                    match identity.code(&self.host) {
+                        Ok(code) => {
+                            ui.label(format!(
+                                "Android connects to {}:{}",
+                                self.host.trim(),
+                                pairing::LISTEN_ADDRESS.port()
+                            ));
+                            if ui.button("Copy pairing code").clicked() {
+                                ui.ctx().copy_text(code.clone());
+                            }
+                            ui.label("Paste into Android Settings → Desktop pairing. Install the desktop inspection CA from Settings.");
+                            if let Ok(qr) = qrcode::QrCode::new(code.as_bytes()) {
+                                let quiet = 4;
+                                let modules = qr.width() + quiet * 2;
+                                let scale = (ui.available_width().min(420.) / modules as f32)
+                                    .floor()
+                                    .max(1.);
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(modules as f32 * scale, modules as f32 * scale),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(rect, 0, egui::Color32::WHITE);
+                                for y in 0..qr.width() {
+                                    for x in 0..qr.width() {
+                                        if qr[(x, y)] == qrcode::Color::Dark {
+                                            ui.painter().rect_filled(
+                                                egui::Rect::from_min_size(
+                                                    rect.min
+                                                        + egui::vec2(
+                                                            (x + quiet) as f32 * scale,
+                                                            (y + quiet) as f32 * scale,
+                                                        ),
+                                                    egui::vec2(scale, scale),
+                                                ),
+                                                0,
+                                                egui::Color32::BLACK,
+                                            );
+                                        }
                                     }
                                 }
                             }
+                        }
+                        Err(message) => {
+                            ui.label(message);
                         }
                     }
                 }
@@ -255,6 +319,7 @@ impl App {
                         Err(e) => *self.notice.lock().unwrap() = e,
                     }
                 }
+                });
             }
             _ => {}
         }

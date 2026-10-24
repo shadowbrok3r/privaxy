@@ -25,8 +25,13 @@ pinned in `app/Cargo.toml`. The default desktop UI includes custom window chrome
 and the theme preset picker under Settings. The previous Dioxus UI remains available with
 `cargo run -p privaxy-app --features legacy --bin privaxy-legacy`.
 
-1. Open **Android pairing**, enter the computer's reachable LAN address, and enable
-   the relay (TCP 8101). Keep the regular proxy on loopback port 8100.
+1. Open **Android pairing**. The computer's Tailscale IPv4 address is selected
+   automatically when available, otherwise its LAN address. Click the **Tailscale**
+   or **LAN** address to fill the editable field; use **Refresh addresses** after
+   changing networks. Android must be connected to the same tailnet to use the
+   Tailscale address, or the same reachable LAN to use the LAN address. Enable the
+   relay, which listens on all interfaces at `0.0.0.0:8101`. Pairing codes contain
+   the selected address. The regular HTTP proxy stays on `127.0.0.1:8100`.
 2. Copy the pairing code, or scan the QR with a scanner and copy its text. In Android
    Settings, use **Paste pairing code**, then **Pair desktop**.
 3. Enable **Route captured TCP traffic through desktop** and **Capture all traffic**
@@ -40,6 +45,11 @@ remain direct; the Android QUIC setting can force compatible apps to TCP. If the
 relay is unavailable, TCP fails instead of silently bypassing it. Disable the relay
 to close active paired connections, or revoke all pairings to rotate its credentials.
 The relay must be enabled again after restarting the desktop app.
+
+Android permits one VPN per profile. Privaxy's **Capture all traffic** mode and
+the Tailscale Android VPN cannot run together. Use the LAN address for full-device
+capture unless the phone's network already routes to the tailnet. Tailscale pairing
+requires a reachable tailnet route; selecting the address does not create one.
 
 ## About
 
