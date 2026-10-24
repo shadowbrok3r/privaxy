@@ -1,8 +1,15 @@
 use std::net::{IpAddr, Ipv4Addr};
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct InterfaceAddress {
+    pub interface: String,
+    pub ip: Ipv4Addr,
+}
+
 pub struct Addresses {
-    pub lan: Option<Ipv4Addr>,
-    pub tailscale: Option<Ipv4Addr>,
+    pub lan: Vec<InterfaceAddress>,
+    pub tailscale: Vec<InterfaceAddress>,
+    pub other: Vec<InterfaceAddress>,
     pub tailscale_installed: bool,
 }
 
@@ -22,42 +29,46 @@ impl Addresses {
 
     pub fn preferred_host(&self) -> String {
         self.tailscale
-            .or(self.lan)
-            .map(|ip| ip.to_string())
+            .first()
+            .or_else(|| self.lan.first())
+            .map(|address| address.ip.to_string())
             .unwrap_or_default()
     }
 
     fn from_interfaces(interfaces: &[if_addrs::Interface], installed: bool) -> Self {
-        let is_tailscale = |interface: &&if_addrs::Interface| {
-            interface.name.to_ascii_lowercase().starts_with("tailscale")
+        let mut addresses = Self {
+            lan: Vec::new(),
+            tailscale: Vec::new(),
+            other: Vec::new(),
+            tailscale_installed: installed,
         };
-        let tailscale_interfaces: Vec<_> = interfaces.iter().filter(is_tailscale).collect();
-        let tailscale = tailscale_interfaces.iter().find_map(|interface| {
-            let IpAddr::V4(ip) = interface.ip() else {
-                return None;
-            };
-            (interface.is_oper_up() && !ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+        // Keep every assigned address, including aliases on the same interface.
+        // Ordering only chooses a default; it must not hide Wi-Fi behind Ethernet.
+        let mut active: Vec<_> = interfaces
+            .iter()
+            .filter_map(|interface| {
+                let name = interface.name.to_ascii_lowercase();
+                addresses.tailscale_installed |= name.starts_with("tailscale");
+                let IpAddr::V4(ip) = interface.ip() else {
+                    return None;
+                };
+                (interface.is_oper_up()
+                    && !ip.is_unspecified()
+                    && !ip.is_loopback()
+                    && !ip.is_multicast()
+                    && !ip.is_broadcast())
+                .then_some((interface, ip, name))
+            })
+            .collect();
+        active.sort_by_key(|(interface, ip, _)| {
+            (
+                !ip.is_private(),
+                interface.index.unwrap_or(u32::MAX),
+                *ip,
+                &interface.name,
+            )
         });
-        Self {
-            lan: preferred_lan_address(interfaces),
-            tailscale,
-            tailscale_installed: installed || !tailscale_interfaces.is_empty(),
-        }
-    }
-}
-
-fn preferred_lan_address(interfaces: &[if_addrs::Interface]) -> Option<Ipv4Addr> {
-    interfaces
-        .iter()
-        .filter(|interface| interface.is_oper_up() && !interface.is_p2p())
-        .filter_map(|interface| {
-            let IpAddr::V4(ip) = interface.ip() else {
-                return None;
-            };
-            let name = interface.name.to_ascii_lowercase();
-            // A VPN default route or a VM/container bridge is usually not the
-            // network shared with the phone. These addresses remain usable as
-            // manual overrides in the pairing page.
+        for (interface, ip, name) in active {
             let virtual_interface = [
                 "docker",
                 "br-",
@@ -67,7 +78,6 @@ fn preferred_lan_address(interfaces: &[if_addrs::Interface]) -> Option<Ipv4Addr>
                 "vmware",
                 "vboxnet",
                 "virtualbox",
-                "tailscale",
                 "tun",
                 "tap",
                 "utun",
@@ -75,19 +85,23 @@ fn preferred_lan_address(interfaces: &[if_addrs::Interface]) -> Option<Ipv4Addr>
             ]
             .iter()
             .any(|prefix| name.starts_with(prefix));
-            if virtual_interface
-                || ip.is_unspecified()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_multicast()
-                || ip.is_broadcast()
-            {
-                return None;
+            let list = if name.starts_with("tailscale") {
+                &mut addresses.tailscale
+            } else if virtual_interface || interface.is_p2p() || ip.is_link_local() {
+                &mut addresses.other
+            } else {
+                &mut addresses.lan
+            };
+            let address = InterfaceAddress {
+                interface: interface.name.clone(),
+                ip,
+            };
+            if !list.contains(&address) {
+                list.push(address);
             }
-            Some((ip, interface.index.unwrap_or(u32::MAX)))
-        })
-        .min_by_key(|(ip, index)| (!ip.is_private(), *index, *ip))
-        .map(|(ip, _)| ip)
+        }
+        addresses
+    }
 }
 
 #[cfg(test)]
@@ -121,15 +135,36 @@ mod tests {
             interface("lo", [127, 0, 0, 1]),
             interface("enp9s0", [192, 168, 4, 2]),
         ];
-        assert_eq!(
-            preferred_lan_address(&interfaces),
-            Some([192, 168, 4, 2].into())
-        );
         let addresses = Addresses::from_interfaces(&interfaces, false);
-        assert_eq!(addresses.lan, Some([192, 168, 4, 2].into()));
-        assert_eq!(addresses.tailscale, Some([100, 116, 134, 128].into()));
+        assert_eq!(addresses.lan.len(), 1);
+        assert_eq!(addresses.lan[0].ip, Ipv4Addr::new(192, 168, 4, 2));
+        assert_eq!(addresses.tailscale[0].ip, Ipv4Addr::new(100, 116, 134, 128));
+        assert_eq!(addresses.other.len(), 3);
         assert!(addresses.tailscale_installed);
         assert_eq!(addresses.preferred_host(), "100.116.134.128");
+    }
+
+    #[test]
+    fn lists_ethernet_wifi_and_aliases_without_duplicate_entries() {
+        let mut ethernet = interface("enp9s0", [192, 168, 4, 2]);
+        ethernet.index = Some(2);
+        let mut wifi = interface("wlan0", [192, 168, 1, 10]);
+        wifi.index = Some(3);
+        let mut alias = interface("wlan0", [192, 168, 1, 11]);
+        alias.index = Some(3);
+        let mut interfaces = vec![wifi.clone(), alias, ethernet, wifi];
+        let addresses = Addresses::from_interfaces(&interfaces, false);
+        assert_eq!(addresses.lan.len(), 3);
+        assert_eq!(addresses.lan[0].interface, "enp9s0");
+        assert_eq!(addresses.lan[1].interface, "wlan0");
+        assert_eq!(addresses.lan[1].ip, Ipv4Addr::new(192, 168, 1, 10));
+        assert_eq!(addresses.lan[2].ip, Ipv4Addr::new(192, 168, 1, 11));
+        assert_eq!(addresses.preferred_host(), "192.168.4.2");
+        interfaces.reverse();
+        assert_eq!(
+            Addresses::from_interfaces(&interfaces, false).lan,
+            addresses.lan
+        );
     }
 
     #[test]
@@ -145,12 +180,10 @@ mod tests {
             interface("ethernet", [0, 0, 0, 0]),
             interface("docker0", [172, 17, 0, 1]),
         ];
-        assert_eq!(preferred_lan_address(&interfaces), None);
-        assert!(
-            Addresses::from_interfaces(&interfaces, false)
-                .preferred_host()
-                .is_empty()
-        );
+        let addresses = Addresses::from_interfaces(&interfaces, false);
+        assert!(addresses.lan.is_empty());
+        assert!(addresses.preferred_host().is_empty());
+        assert_eq!(addresses.other.len(), 2);
     }
 
     #[test]
@@ -160,7 +193,7 @@ mod tests {
         let interfaces = [tailscale, interface("wlan0", [192, 168, 1, 10])];
         let addresses = Addresses::from_interfaces(&interfaces, true);
         assert!(addresses.tailscale_installed);
-        assert_eq!(addresses.tailscale, None);
+        assert!(addresses.tailscale.is_empty());
         assert_eq!(addresses.preferred_host(), "192.168.1.10");
     }
 }

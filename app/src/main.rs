@@ -187,36 +187,32 @@ impl App {
                     "Relay listens on {} (all network interfaces).",
                     pairing::LISTEN_ADDRESS
                 ));
-                ui.label("Choose the desktop address Android should use. Tailscale is preferred when available.");
+                ui.label("Choose an active IPv4 address your phone can reach. For Wi-Fi, select the address on the phone's network. Tailscale is preferred initially.");
                 ui.horizontal_wrapped(|ui| {
-                    if let Some(ip) = self.addresses.tailscale {
-                        let address = ip.to_string();
-                        if ui
-                            .selectable_label(
-                                self.host.trim() == address,
-                                format!("Tailscale: {address}"),
-                            )
-                            .clicked()
-                        {
-                            self.host = address;
+                    for (kind, addresses) in [
+                        ("Tailscale", &self.addresses.tailscale),
+                        ("LAN", &self.addresses.lan),
+                        ("Other", &self.addresses.other),
+                    ] {
+                        for entry in addresses {
+                            let address = entry.ip.to_string();
+                            if ui
+                                .selectable_label(
+                                    self.host.trim() == address,
+                                    format!("{kind} · {}: {address}", entry.interface),
+                                )
+                                .clicked()
+                            {
+                                self.host = address;
+                            }
                         }
-                    } else if self.addresses.tailscale_installed {
+                    }
+                    if self.addresses.tailscale.is_empty() && self.addresses.tailscale_installed {
                         ui.label(
                             "Tailscale: no active IPv4 address. Start Tailscale, then refresh.",
                         );
                     }
-                    if let Some(ip) = self.addresses.lan {
-                        let address = ip.to_string();
-                        if ui
-                            .selectable_label(
-                                self.host.trim() == address,
-                                format!("LAN: {address}"),
-                            )
-                            .clicked()
-                        {
-                            self.host = address;
-                        }
-                    } else {
+                    if self.addresses.lan.is_empty() {
                         ui.label("LAN: no active IPv4 address found.");
                     }
                 });
@@ -227,14 +223,13 @@ impl App {
                     );
                     if ui.button("Refresh addresses").clicked() {
                         self.addresses = network::Addresses::detect();
-                        let preferred = self.addresses.preferred_host();
-                        if !preferred.is_empty() {
-                            self.host = preferred;
+                        if self.host.trim().is_empty() {
+                            self.host = self.addresses.preferred_host();
                         }
                     }
                 });
-                if self.addresses.tailscale.is_some_and(|ip| self.host.trim() == ip.to_string()) {
-                    ui.label("Android allows one VPN at a time. For full-device capture, choose LAN unless your network already routes to Tailscale.");
+                if self.addresses.tailscale.iter().any(|address| self.host.trim() == address.ip.to_string()) {
+                    ui.label("On Android, keep Tailscale connected and Privaxy included in its routing. Leave Capture all traffic OFF; enable desktop routing and use Privaxy's local HTTP proxy in supported apps (127.0.0.1:8100 by default). Split tunneling cannot run two Android VPNs. For full-device capture, choose LAN or a gateway that routes to Tailscale.");
                 }
                 if self.relay.is_none() {
                     if ui

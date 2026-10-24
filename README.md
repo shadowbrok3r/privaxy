@@ -26,9 +26,12 @@ and the theme preset picker under Settings. The previous Dioxus UI remains avail
 `cargo run -p privaxy-app --features legacy --bin privaxy-legacy`.
 
 1. Open **Android pairing**. The computer's Tailscale IPv4 address is selected
-   automatically when available, otherwise its LAN address. Click the **Tailscale**
-   or **LAN** address to fill the editable field; use **Refresh addresses** after
-   changing networks. Android must be connected to the same tailnet to use the
+   automatically when available, otherwise a LAN address. Every active IPv4 address
+   is listed with its interface name, including separate Ethernet and Wi-Fi addresses
+   and any aliases. VPN/VM/container addresses appear under **Other** and are not
+   chosen as defaults. Click the address reachable from your phone to fill the field;
+   use **Refresh addresses** after changing networks (it keeps your selected address).
+   Android must be connected to the same tailnet to use the
    Tailscale address, or the same reachable LAN to use the LAN address. Enable the
    relay, which listens on all interfaces at `0.0.0.0:8101`. Pairing codes contain
    the selected address. The regular HTTP proxy stays on `127.0.0.1:8100`.
