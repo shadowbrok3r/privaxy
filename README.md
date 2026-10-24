@@ -19,9 +19,10 @@
 
 ## Native desktop and Android pairing
 
-Run `cargo run -p privaxy-app`. The default desktop UI uses egui-theme-kit from
-`../egui-theme-kit`, including custom window chrome and the theme preset picker
-under Settings. The previous Dioxus UI remains available with
+Run `cargo run -p privaxy-app`. Cargo fetches egui-theme-kit from
+[its Git repository](https://github.com/shadowbrok3r/egui-theme-kit) at the revision
+pinned in `app/Cargo.toml`. The default desktop UI includes custom window chrome
+and the theme preset picker under Settings. The previous Dioxus UI remains available with
 `cargo run -p privaxy-app --features legacy --bin privaxy-legacy`.
 
 1. Open **Android pairing**, enter the computer's reachable LAN address, and enable

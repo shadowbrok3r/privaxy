@@ -1973,6 +1973,7 @@ dependencies = [
 [[package]]
 name = "egui-theme-kit"
 version = "0.1.0"
+source = "git+https://github.com/shadowbrok3r/egui-theme-kit?rev=09d1e793076357ec5d86df7e1d6771d0306f2e70#09d1e793076357ec5d86df7e1d6771d0306f2e70"
 dependencies = [
  "anyhow",
  "directories",
