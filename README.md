@@ -17,6 +17,29 @@
 <img width="666" alt="taskbar" src="https://user-images.githubusercontent.com/45085843/210057833-df002cfd-aecf-4d67-bdd6-225ac3d6b980.png">
 </div>
 
+## Native desktop and Android pairing
+
+Run `cargo run -p privaxy-app`. The default desktop UI uses egui-theme-kit from
+`../egui-theme-kit`, including custom window chrome and the theme preset picker
+under Settings. The previous Dioxus UI remains available with
+`cargo run -p privaxy-app --features legacy --bin privaxy-legacy`.
+
+1. Open **Android pairing**, enter the computer's reachable LAN address, and enable
+   the relay (TCP 8101). Keep the regular proxy on loopback port 8100.
+2. Copy the pairing code, or scan the QR with a scanner and copy its text. In Android
+   Settings, use **Paste pairing code**, then **Pair desktop**.
+3. Enable **Route captured TCP traffic through desktop** and **Capture all traffic**
+   on Dashboard. Pairing and the routing preference survive Android restarts.
+4. Export the desktop inspection CA from Settings and install/trust it on clients
+   requiring HTTPS inspection. Pairing's transport certificate is pinned separately;
+   it does not install the inspection CA or bypass app certificate pinning.
+
+Requests appear in the desktop log while routing is enabled. DNS and other UDP
+remain direct; the Android QUIC setting can force compatible apps to TCP. If the
+relay is unavailable, TCP fails instead of silently bypassing it. Disable the relay
+to close active paired connections, or revoke all pairings to rotate its credentials.
+The relay must be enabled again after restarting the desktop app.
+
 ## About
 
 Privaxy is a MITM HTTP(s) proxy that sits in between HTTP(s) talking applications, such as a web browser and HTTP servers, such as those serving websites.

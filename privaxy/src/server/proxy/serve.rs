@@ -155,7 +155,7 @@ pub(crate) async fn serve(
                     response_bytes,
                     adblock_requester,
                     statistics,
-                );
+                ).await;
 
                 let mut new_response = Response::builder()
                     .status(response_status)
@@ -183,7 +183,7 @@ pub(crate) async fn serve(
     Ok(new_response)
 }
 
-fn rewrite_html(
+async fn rewrite_html(
     url: String,
     body: Bytes,
     adblock_requester: AdblockRequester,
@@ -236,13 +236,12 @@ fn rewrite_html(
     }
 
     // Get cosmetic filters
-    let rt = tokio::runtime::Handle::try_current();
-    if let Ok(handle) = rt {
-        let blocker_result = handle.block_on(adblock_requester.get_cosmetic_response(
+    {
+        let blocker_result = adblock_requester.get_cosmetic_response(
             url,
             Vec::from_iter(ids.into_iter()),
             Vec::from_iter(classes.into_iter()),
-        ));
+        ).await;
 
         let mut response_has_been_modified = false;
 
