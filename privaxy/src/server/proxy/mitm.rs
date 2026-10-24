@@ -2,7 +2,7 @@ use super::{exclusions::LocalExclusionStore, serve::serve};
 use crate::{blocker::AdblockRequester, cert::CertCache, events::Event, statistics::Statistics};
 use bytes::Bytes;
 use http::uri::{Authority, Scheme};
-use http_body_util::{combinators::BoxBody, BodyExt, Empty};
+use http_body_util::{BodyExt, Empty, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -57,6 +57,7 @@ pub(crate) async fn serve_mitm_session(
     statistics: Statistics,
     client_ip_address: IpAddr,
     local_exclusion_store: LocalExclusionStore,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Response<BoxBodyType>, hyper::Error> {
     let authority = match extract_authority(&req) {
         Some(authority) => authority,
@@ -89,71 +90,81 @@ pub(crate) async fn serve_mitm_session(
         let server_configuration = cert_cache.get(authority.clone()).await.server_configuration;
 
         tokio::task::spawn(async move {
-            let upgraded = match tokio::time::timeout(TLS_TIMEOUT, hyper::upgrade::on(req)).await {
-                Ok(Ok(upgraded)) => upgraded,
-                Ok(Err(e)) => {
-                    log::debug!("Upgrade error: {}", e);
+            let session_cancellation = cancellation.clone();
+            let session = async move {
+                let upgraded =
+                    match tokio::time::timeout(TLS_TIMEOUT, hyper::upgrade::on(req)).await {
+                        Ok(Ok(upgraded)) => upgraded,
+                        Ok(Err(e)) => {
+                            log::debug!("Upgrade error: {}", e);
+                            return;
+                        }
+                        Err(_) => {
+                            log::debug!("Upgrade timed out for {}", authority);
+                            return;
+                        }
+                    };
+
+                let is_host_blacklisted = local_exclusion_store.contains(authority.host());
+
+                if is_host_blacklisted {
+                    let mut upgraded = TokioIo::new(upgraded);
+                    let _ = tokio::time::timeout(TUNNEL_TIMEOUT, tunnel(&mut upgraded, &authority))
+                        .await;
                     return;
                 }
-                Err(_) => {
-                    log::debug!("Upgrade timed out for {}", authority);
-                    return;
-                }
-            };
 
-            let is_host_blacklisted = local_exclusion_store.contains(authority.host());
+                let tls_stream = match tokio::time::timeout(
+                    TLS_TIMEOUT,
+                    TlsAcceptor::from(server_configuration).accept(TokioIo::new(upgraded)),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                            log::debug!(
+                                "TLS handshake failed for {}: connection closed",
+                                authority
+                            );
+                        } else {
+                            log::debug!("TLS handshake failed for {}: {}", authority, error);
+                        }
+                        return;
+                    }
+                    Err(_) => {
+                        log::debug!("TLS handshake timed out for {}", authority);
+                        return;
+                    }
+                };
 
-            if is_host_blacklisted {
-                let mut upgraded = TokioIo::new(upgraded);
+                let io = TokioIo::new(tls_stream);
+
+                let service = service_fn(move |req| {
+                    serve(
+                        adblock_requester.clone(),
+                        req,
+                        client.clone(),
+                        authority.clone(),
+                        Scheme::HTTPS,
+                        broadcast_tx.clone(),
+                        statistics.clone(),
+                        client_ip_address,
+                        session_cancellation.clone(),
+                    )
+                });
+
                 let _ = tokio::time::timeout(
                     TUNNEL_TIMEOUT,
-                    tunnel(&mut upgraded, &authority)
-                ).await;
-                return;
-            }
-
-            let tls_stream = match tokio::time::timeout(
-                TLS_TIMEOUT,
-                TlsAcceptor::from(server_configuration).accept(TokioIo::new(upgraded))
-            ).await {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(error)) => {
-                    if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                        log::debug!("TLS handshake failed for {}: connection closed", authority);
-                    } else {
-                        log::debug!("TLS handshake failed for {}: {}", authority, error);
-                    }
-                    return;
-                }
-                Err(_) => {
-                    log::debug!("TLS handshake timed out for {}", authority);
-                    return;
-                }
-            };
-
-            let io = TokioIo::new(tls_stream);
-
-            let service = service_fn(move |req| {
-                serve(
-                    adblock_requester.clone(),
-                    req,
-                    client.clone(),
-                    authority.clone(),
-                    Scheme::HTTPS,
-                    broadcast_tx.clone(),
-                    statistics.clone(),
-                    client_ip_address,
+                    http1::Builder::new()
+                        .preserve_header_case(true)
+                        .title_case_headers(true)
+                        .serve_connection(io, service)
+                        .with_upgrades(),
                 )
-            });
-
-            let _ = tokio::time::timeout(
-                TUNNEL_TIMEOUT,
-                http1::Builder::new()
-                    .preserve_header_case(true)
-                    .title_case_headers(true)
-                    .serve_connection(io, service)
-                    .with_upgrades()
-            ).await;
+                .await;
+            };
+            tokio::select! { biased; _ = cancellation.cancelled() => {}, _ = session => {} }
         });
 
         Ok(Response::new(empty_body()))
@@ -169,6 +180,7 @@ pub(crate) async fn serve_mitm_session(
             broadcast_tx,
             statistics,
             client_ip_address,
+            cancellation,
         )
         .await
     }

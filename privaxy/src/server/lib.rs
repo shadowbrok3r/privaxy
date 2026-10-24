@@ -5,13 +5,12 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use reqwest::redirect::Policy;
-use rustls::crypto::ring::default_provider;
 use rustls::crypto::CryptoProvider;
+use rustls::crypto::ring::default_provider;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 pub mod blocker;
@@ -20,16 +19,16 @@ mod ca;
 mod cert;
 pub mod configuration;
 pub mod events;
+pub mod listener;
 mod proxy;
 pub mod statistics;
 
-// Higher connection limit - keep-alive connections stay open
-const MAX_CONNECTIONS: usize = 1024;
 // Shorter timeout for idle connections
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct PrivaxyServer {
+    pub listener: listener::ProxyListener,
     pub ca_certificate_pem: String,
     pub configuration_updater_sender: tokio::sync::mpsc::Sender<configuration::Configuration>,
     pub configuration_save_lock: Arc<tokio::sync::Mutex<()>>,
@@ -41,6 +40,12 @@ pub struct PrivaxyServer {
 }
 
 pub async fn start_privaxy() -> PrivaxyServer {
+    try_start_privaxy()
+        .await
+        .expect("Unable to initialize Privaxy")
+}
+
+pub async fn try_start_privaxy() -> Result<PrivaxyServer, String> {
     // Install the ring crypto provider for rustls
     let _ = CryptoProvider::install_default(default_provider());
 
@@ -59,42 +64,20 @@ pub async fn start_privaxy() -> PrivaxyServer {
         .connect_timeout(Duration::from_secs(10))
         .pool_max_idle_per_host(10)
         .build()
-        .unwrap();
+        .map_err(|error| error.to_string())?;
 
-    let configuration = match configuration::Configuration::read_from_home(client.clone()).await {
-        Ok(configuration) => configuration,
-        Err(err) => {
-            println!(
-                "An error occured while trying to process the configuration file: {:?}",
-                err
-            );
-            std::process::exit(1)
-        }
-    };
+    let configuration = configuration::Configuration::read_from_home(client.clone())
+        .await
+        .map_err(|error| format!("Cannot load configuration: {error}"))?;
 
     let local_exclusion_store =
         LocalExclusionStore::new(Vec::from_iter(configuration.exclusions.clone().into_iter()));
     let local_exclusion_store_clone = local_exclusion_store.clone();
 
-    let ca_certificate = match configuration.ca_certificate() {
-        Ok(ca_certificate) => ca_certificate,
-        Err(err) => {
-            println!("Unable to decode ca certificate: {:?}", err);
-            std::process::exit(1)
-        }
-    };
-
-    let ca_certificate_pem = std::str::from_utf8(&ca_certificate.to_pem().unwrap())
-        .unwrap()
-        .to_string();
-
-    let ca_private_key = match configuration.ca_private_key() {
-        Ok(ca_private_key) => ca_private_key,
-        Err(err) => {
-            println!("Unable to decode ca private key: {:?}", err);
-            std::process::exit(1)
-        }
-    };
+    let ca_certificate = configuration.ca_certificate().map_err(|e| e.to_string())?;
+    let ca_certificate_pem = String::from_utf8(ca_certificate.to_pem().map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let ca_private_key = configuration.ca_private_key().map_err(|e| e.to_string())?;
 
     let cert_cache = cert::CertCache::new(ca_certificate, ca_private_key);
 
@@ -138,53 +121,16 @@ pub async fn start_privaxy() -> PrivaxyServer {
 
     let proxy_server_addr = SocketAddr::from((ip, 8100));
 
-    // Spawn the proxy server
-    let client_for_server = client.clone();
-    let cert_cache_for_server = cert_cache.clone();
-    let broadcast_tx_for_server = broadcast_tx.clone();
-    let statistics_for_server = statistics.clone();
-    let blocker_requester_for_server = blocker_requester.clone();
-    let local_exclusion_store_for_server = local_exclusion_store.clone();
-
-    // Track active connections
-    let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-    tokio::spawn(async move {
-        let listener = TcpListener::bind(proxy_server_addr).await.unwrap();
-        log::info!("Proxy available at http://{}", proxy_server_addr);
-
-        loop {
-            let (stream, client_addr) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    log::error!("Failed to accept connection: {}", e);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            };
-
-            // Check connection count
-            let current = active_connections.load(std::sync::atomic::Ordering::Relaxed);
-            if current >= MAX_CONNECTIONS {
-                log::warn!("Connection limit reached ({}), dropping connection from {}", current, client_addr);
-                drop(stream);
-                continue;
-            }
-
-            let conn_count = active_connections.clone();
-            conn_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-            let client_ip_address = client_addr.ip();
-            let io = TokioIo::new(stream);
-
-            let client = client_for_server.clone();
-            let cert_cache = cert_cache_for_server.clone();
-            let broadcast_tx = broadcast_tx_for_server.clone();
-            let statistics = statistics_for_server.clone();
-            let blocker_requester = blocker_requester_for_server.clone();
-            let local_exclusion_store = local_exclusion_store_for_server.clone();
-
-            tokio::spawn(async move {
+    let listener = listener::ProxyListener::spawn(
+        proxy_server_addr,
+        move |stream, client_addr, cancellation| {
+            let client = client.clone();
+            let cert_cache = cert_cache.clone();
+            let broadcast_tx = broadcast_tx.clone();
+            let statistics = statistics.clone();
+            let blocker_requester = blocker_requester.clone();
+            let local_exclusion_store = local_exclusion_store.clone();
+            async move {
                 let service = service_fn(move |req| {
                     proxy::serve_mitm_session(
                         blocker_requester.clone(),
@@ -193,39 +139,30 @@ pub async fn start_privaxy() -> PrivaxyServer {
                         cert_cache.clone(),
                         broadcast_tx.clone(),
                         statistics.clone(),
-                        client_ip_address,
+                        client_addr.ip(),
                         local_exclusion_store.clone(),
+                        cancellation.clone(),
                     )
                 });
-
-                // Serve with timeout
                 let result = tokio::time::timeout(
                     IDLE_TIMEOUT,
                     http1::Builder::new()
                         .preserve_header_case(true)
                         .title_case_headers(true)
                         .keep_alive(true)
-                        .serve_connection(io, service)
-                        .with_upgrades()
-                ).await;
-
-                // Decrement connection count when done
-                conn_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-
-                match result {
-                    Ok(Err(err)) => {
-                        log::debug!("Connection error: {}", err);
-                    }
-                    Err(_) => {
-                        log::debug!("Connection idle timeout");
-                    }
-                    Ok(Ok(())) => {}
+                        .serve_connection(TokioIo::new(stream), service)
+                        .with_upgrades(),
+                )
+                .await;
+                if let Ok(Err(error)) = result {
+                    log::debug!("Connection error: {error}");
                 }
-            });
-        }
-    });
+            }
+        },
+    );
 
-    PrivaxyServer {
+    Ok(PrivaxyServer {
+        listener,
         ca_certificate_pem,
         configuration_updater_sender: configuration_updater_tx,
         configuration_save_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -233,5 +170,5 @@ pub async fn start_privaxy() -> PrivaxyServer {
         statistics: statistics_clone,
         local_exclusion_store: local_exclusion_store_clone,
         requests_broadcast_sender: broadcast_tx_clone,
-    }
+    })
 }

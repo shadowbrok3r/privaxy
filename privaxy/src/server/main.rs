@@ -15,7 +15,8 @@ async fn main() {
 
     env_logger::init();
 
-    start_privaxy().await;
+    // Retain the listener controller for the lifetime of the headless process.
+    let _server = start_privaxy().await;
 
     loop {
         tokio::time::sleep(Duration::from_secs(3600 * 24 * 30 * 365)).await

@@ -25,7 +25,22 @@ pinned in `app/Cargo.toml`. The default desktop UI includes custom window chrome
 and the theme preset picker under Settings. The previous Dioxus UI remains available with
 `cargo run -p privaxy-app --features legacy --bin privaxy-legacy`.
 
-1. Open **Android pairing**. The computer's Tailscale IPv4 address is selected
+The title bar has three pages: **Dashboard**, **Traffic**, and **Settings**.
+Dashboard combines proxy controls, filtering, Android connection status, a live
+request chart, top destinations, and recent requests. Traffic provides the full
+searchable log; Settings contains appearance, filter lists, custom rules, and
+HTTPS exclusions.
+
+For desktop use, the proxy starts automatically on `127.0.0.1:8100`. Choose
+**Connect this computer** on Dashboard for browser/system setup and CA export.
+Configure both HTTP and HTTPS proxy fields with host `127.0.0.1`, port `8100`.
+**Test proxy** sends a real HTTP request through the listener. **Stop proxy**
+closes the listener, active HTTP/CONNECT streams, and Android relay; **Start proxy**
+reopens it without clearing statistics or reinitializing filters. Bind errors
+appear on Dashboard and can be retried after freeing the port. Android is optional.
+
+1. Open **Pair phone / addresses** on Dashboard (or click Android status in the
+   title bar). The computer's Tailscale IPv4 address is selected
    automatically when available, otherwise a LAN address. Every active IPv4 address
    is listed with its interface name, including separate Ethernet and Wi-Fi addresses
    and any aliases. VPN/VM/container addresses appear under **Other** and are not
@@ -61,6 +76,12 @@ verified live connection and retries automatically. Desktop retains verification
 for the current session; restarting it waits for the phone to authenticate again.
 Connection loss is detected within about 8 seconds on Android and 12 seconds on
 desktop; closing the app or disabling/revoking the relay closes the connection.
+On Android, **Check connection** retries immediately without removing the saved
+pairing. A connection error identifies the saved endpoint. **No route to host**
+means network reachability failed before TLS authentication; check Wi-Fi client
+isolation and firewall access to TCP 8101. If the desktop is using a Tailscale
+exit node, enable its **Allow LAN access** option. Matching IP subnets or a saved
+pairing alone do not establish that the relay is reachable.
 
 Android permits one VPN per profile. Privaxy's **Capture all traffic** mode and
 the Tailscale Android VPN cannot run together. Use the LAN address for full-device

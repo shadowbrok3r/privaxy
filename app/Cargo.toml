@@ -51,6 +51,7 @@ if-addrs = "0.15"
 
 [features]
 default = []
+inspection = ["eframe/inspection"]
 legacy = ["dep:dioxus"]
 
 [[bin]]

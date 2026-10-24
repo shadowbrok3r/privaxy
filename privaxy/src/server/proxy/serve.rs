@@ -7,9 +7,9 @@ use bytes::Bytes;
 use http::uri::{Authority, Scheme};
 use http::{StatusCode, Uri};
 use http_body_util::{BodyExt, Empty, Full};
-use hyper::body::Incoming;
 use hyper::Request;
 use hyper::Response;
+use hyper::body::Incoming;
 use std::net::IpAddr;
 use tokio::sync::broadcast;
 
@@ -35,13 +35,14 @@ pub(crate) async fn serve(
     broadcast_sender: broadcast::Sender<Event>,
     statistics: Statistics,
     client_ip_address: IpAddr,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<Response<BoxBodyType>, hyper::Error> {
     // Check if this is a direct request to the proxy itself (not a proxy request)
     // This happens with PAC file checks, WPAD, or direct browser access
-    let is_direct_proxy_request = authority.host() == "127.0.0.1" || 
-                                   authority.host() == "localhost" ||
-                                   authority.host() == "::1";
-    
+    let is_direct_proxy_request = authority.host() == "127.0.0.1"
+        || authority.host() == "localhost"
+        || authority.host() == "::1";
+
     if is_direct_proxy_request && authority.port_u16() == Some(8100) {
         // Return a simple status page for direct requests to the proxy
         return Ok(get_proxy_status_page());
@@ -65,7 +66,7 @@ pub(crate) async fn serve(
     };
 
     if request.headers().contains_key(http::header::UPGRADE) {
-        return Ok(perform_two_ends_upgrade(request, uri, client).await);
+        return Ok(perform_two_ends_upgrade(request, uri, client, cancellation).await);
     }
 
     let (parts, body) = request.into_parts();
@@ -155,7 +156,8 @@ pub(crate) async fn serve(
                     response_bytes,
                     adblock_requester,
                     statistics,
-                ).await;
+                )
+                .await;
 
                 let mut new_response = Response::builder()
                     .status(response_status)
@@ -167,7 +169,7 @@ pub(crate) async fn serve(
                 headers.remove(http::header::CONTENT_LENGTH);
                 headers.remove(http::header::TRANSFER_ENCODING);
                 *new_response.headers_mut() = headers;
-                
+
                 return Ok(new_response);
             }
         }
@@ -189,7 +191,7 @@ async fn rewrite_html(
     adblock_requester: AdblockRequester,
     statistics: Statistics,
 ) -> Bytes {
-    use lol_html::{element, HtmlRewriter, Settings};
+    use lol_html::{HtmlRewriter, Settings, element};
     use regex::Regex;
     use std::collections::HashSet;
     use std::fmt::Write;
@@ -237,11 +239,13 @@ async fn rewrite_html(
 
     // Get cosmetic filters
     {
-        let blocker_result = adblock_requester.get_cosmetic_response(
-            url,
-            Vec::from_iter(ids.into_iter()),
-            Vec::from_iter(classes.into_iter()),
-        ).await;
+        let blocker_result = adblock_requester
+            .get_cosmetic_response(
+                url,
+                Vec::from_iter(ids.into_iter()),
+                Vec::from_iter(classes.into_iter()),
+            )
+            .await;
 
         let mut response_has_been_modified = false;
 
@@ -406,6 +410,7 @@ async fn perform_two_ends_upgrade(
     request: Request<Incoming>,
     uri: Uri,
     _client: reqwest::Client,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Response<BoxBodyType> {
     // For WebSocket upgrades, we'll tunnel directly
     let host = uri.host().unwrap_or("localhost");
@@ -413,9 +418,9 @@ async fn perform_two_ends_upgrade(
     let addr = format!("{}:{}", host, port);
 
     tokio::spawn(async move {
-        match hyper::upgrade::on(request).await {
-            Ok(upgraded) => {
-                match tokio::net::TcpStream::connect(&addr).await {
+        let session = async move {
+            match hyper::upgrade::on(request).await {
+                Ok(upgraded) => match tokio::net::TcpStream::connect(&addr).await {
                     Ok(mut server) => {
                         let mut upgraded = hyper_util::rt::TokioIo::new(upgraded);
                         let _ = tokio::io::copy_bidirectional(&mut upgraded, &mut server).await;
@@ -423,12 +428,13 @@ async fn perform_two_ends_upgrade(
                     Err(e) => {
                         log::debug!("Unable to connect to upstream for upgrade: {}", e)
                     }
+                },
+                Err(e) => {
+                    log::debug!("Unable to upgrade: {}", e)
                 }
             }
-            Err(e) => {
-                log::debug!("Unable to upgrade: {}", e)
-            }
-        }
+        };
+        tokio::select! { biased; _ = cancellation.cancelled() => {}, _ = session => {} }
     });
 
     Response::builder()
