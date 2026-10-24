@@ -2200,6 +2200,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-data-table"
+version = "0.11.0"
+source = "git+https://github.com/shadowbrok3r/egui-data-table?rev=1af2ecfacec6b9058b78b967aba2c08303687f8c#1af2ecfacec6b9058b78b967aba2c08303687f8c"
+dependencies = [
+ "egui",
+ "egui_extras",
+ "itertools 0.14.0",
+ "serde",
+ "tap",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "egui-theme-kit"
 version = "0.1.0"
 source = "git+https://github.com/shadowbrok3r/egui-theme-kit?rev=09d1e793076357ec5d86df7e1d6771d0306f2e70#09d1e793076357ec5d86df7e1d6771d0306f2e70"
@@ -2273,6 +2286,7 @@ dependencies = [
  "itertools 0.15.0",
  "log",
  "profiling",
+ "serde",
 ]
 
 [[package]]
@@ -2301,6 +2315,15 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_bytes",
+]
+
+[[package]]
+name = "egui_json_tree"
+version = "0.17.0"
+source = "git+https://github.com/shadowbrok3r/egui_json_tree?rev=84198d09f0e24a65eebbb404199c2a441b3bd958#84198d09f0e24a65eebbb404199c2a441b3bd958"
+dependencies = [
+ "egui",
+ "serde_json",
 ]
 
 [[package]]
@@ -2346,6 +2369,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4532960034c15ba2f55e9eee631040ecc473c32e6c4b200828c759840f13a06"
 dependencies = [
  "enum-map-derive",
+ "serde",
 ]
 
 [[package]]
@@ -5639,12 +5663,15 @@ dependencies = [
  "dioxus",
  "dirs",
  "eframe",
+ "egui-data-table",
  "egui-theme-kit",
+ "egui_json_tree",
  "env_logger",
  "if-addrs",
  "log",
  "num-format",
  "privaxy",
+ "privaxy-diagnostics",
  "qrcode",
  "rand 0.9.5",
  "rcgen",
@@ -5656,6 +5683,15 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-rustls",
+ "url",
+]
+
+[[package]]
+name = "privaxy-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "log",
 ]
 
 [[package]]
@@ -7185,6 +7221,12 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "tap"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
 name = "target-lexicon"

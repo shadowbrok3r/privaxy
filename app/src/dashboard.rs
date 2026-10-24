@@ -302,7 +302,7 @@ impl App {
                     let max = hosts.first().map(|h| h.1).unwrap_or(1);
                     for (host, count) in hosts.iter().take(4) {
                         ui.horizontal(|ui| {
-                            if ui.add(egui::Label::new(host).truncate().sense(egui::Sense::click())).clicked() { self.query=host.clone(); self.tab=Tab::Traffic; }
+                            if ui.add(egui::Label::new(host).truncate().sense(egui::Sense::click())).clicked() { self.traffic.search(host.clone()); self.tab=Tab::Traffic; }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.label(count.to_formatted_string(&Locale::en)); });
                         });
                         ui.add(egui::ProgressBar::new(*count as f32/max as f32).desired_height(4.).fill(t.secondary));
@@ -329,54 +329,14 @@ impl App {
                 );
             }
             for event in events.iter().rev().take(6) {
-                request_row(ui, event, &mut self.selected_event);
-            }
-        });
-    }
-    pub(super) fn traffic(&mut self, ui: &mut egui::Ui, events: &[Event]) {
-        ui.heading("Traffic");
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.query)
-                    .hint_text("Search URL or method")
-                    .desired_width(380.),
-            );
-            for (i, label) in [(0, "All"), (1, "Allowed"), (2, "Blocked")] {
-                ui.selectable_value(&mut self.traffic_filter, i, label);
-            }
-            if ui.button("Clear view").clicked() {
-                self.events.lock().unwrap().clear();
-            }
-        });
-        ui.weak(
-            "Allowed and blocked describe the filter decision. Select a URL to inspect or copy it.",
-        );
-        ui.add_space(8.);
-        let query = self.query.to_lowercase();
-        let rows: Vec<_> = events
-            .iter()
-            .rev()
-            .filter(|e| {
-                (query.is_empty()
-                    || e.url.to_lowercase().contains(&query)
-                    || e.method.to_lowercase().contains(&query))
-                    && match self.traffic_filter {
-                        1 => !e.is_request_blocked,
-                        2 => e.is_request_blocked,
-                        _ => true,
-                    }
-            })
-            .collect();
-        ui.label(format!("{} matching requests", rows.len()));
-        ui.horizontal(request_header);
-        ui.separator();
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show_rows(ui, 23., rows.len(), |ui, range| {
-                for index in range {
-                    request_row(ui, rows[index], &mut self.selected_event);
+                let mut selected = None;
+                request_row(ui, event, &mut selected);
+                if let Some(event) = selected {
+                    self.traffic.select(event);
+                    self.tab = Tab::Traffic;
                 }
-            });
+            }
+        });
     }
     pub(super) fn settings(&mut self, ui: &mut egui::Ui, server: Option<&PrivaxyServer>) {
         ui.heading("Settings");
@@ -569,34 +529,6 @@ impl App {
                     }
                     Err(error) => *self.notice.lock().unwrap() = error,
                 }
-            }
-        }
-        if let Some(event) = self.selected_event.clone() {
-            let mut open = true;
-            egui::Window::new("Request details")
-                .open(&mut open)
-                .default_width(620.)
-                .show(ctx, |ui| {
-                    ui.label(format!(
-                        "{}  {}",
-                        event.method,
-                        event
-                            .now
-                            .with_timezone(&chrono::Local)
-                            .format("%Y-%m-%d %H:%M:%S")
-                    ));
-                    ui.label(if event.is_request_blocked {
-                        "Blocked by filters"
-                    } else {
-                        "Allowed by filters"
-                    });
-                    ui.add(egui::Label::new(&event.url).wrap());
-                    if ui.button("Copy URL").clicked() {
-                        ui.ctx().copy_text(event.url);
-                    }
-                });
-            if !open {
-                self.selected_event = None;
             }
         }
     }

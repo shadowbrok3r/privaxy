@@ -15,7 +15,8 @@ use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio_rustls::TlsAcceptor;
 
-pub type BoxBodyType = BoxBody<Bytes, hyper::Error>;
+pub type BodyError = Box<dyn std::error::Error + Send + Sync>;
+pub type BoxBodyType = BoxBody<Bytes, BodyError>;
 
 // Timeout for TLS handshake and tunnel connections
 const TLS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -58,6 +59,7 @@ pub(crate) async fn serve_mitm_session(
     client_ip_address: IpAddr,
     local_exclusion_store: LocalExclusionStore,
     cancellation: tokio_util::sync::CancellationToken,
+    capture: crate::capture::CaptureStore,
 ) -> Result<Response<BoxBodyType>, hyper::Error> {
     let authority = match extract_authority(&req) {
         Some(authority) => authority,
@@ -78,6 +80,18 @@ pub(crate) async fn serve_mitm_session(
     };
 
     if Method::CONNECT == req.method() {
+        let mut details = crate::capture::Exchange::default();
+        details.client = client_ip_address;
+        details.request_headers = crate::capture::header_pairs(req.headers());
+        details.request_version = req.version();
+        details.status = Some(200);
+        details.response_version = Some(http::Version::HTTP_11);
+        details.note = Some(
+            "TLS tunnel negotiation. Decrypted HTTP exchanges appear as separate sessions.".into(),
+        );
+        let event = capture.begin("CONNECT".into(), authority.to_string(), false, details);
+        let exchange = event.exchange.clone();
+        let _ = broadcast_tx.send(event);
         // Received an HTTP request like:
         // ```
         // CONNECT www.domain.com:443 HTTP/1.1
@@ -90,16 +104,22 @@ pub(crate) async fn serve_mitm_session(
         let server_configuration = cert_cache.get(authority.clone()).await.server_configuration;
 
         tokio::task::spawn(async move {
+            let mut pending = crate::capture::PendingResponse(Some(exchange.clone()));
             let session_cancellation = cancellation.clone();
             let session = async move {
                 let upgraded =
                     match tokio::time::timeout(TLS_TIMEOUT, hyper::upgrade::on(req)).await {
                         Ok(Ok(upgraded)) => upgraded,
                         Ok(Err(e)) => {
+                            exchange
+                                .lock()
+                                .unwrap()
+                                .fail(format!("CONNECT upgrade failed: {e}"));
                             log::debug!("Upgrade error: {}", e);
                             return;
                         }
                         Err(_) => {
+                            exchange.lock().unwrap().fail("CONNECT upgrade timed out");
                             log::debug!("Upgrade timed out for {}", authority);
                             return;
                         }
@@ -108,9 +128,19 @@ pub(crate) async fn serve_mitm_session(
                 let is_host_blacklisted = local_exclusion_store.contains(authority.host());
 
                 if is_host_blacklisted {
+                    exchange.lock().unwrap().note = Some("Host excluded from HTTPS inspection. Encrypted tunnel bytes are not decoded.".into());
                     let mut upgraded = TokioIo::new(upgraded);
-                    let _ = tokio::time::timeout(TUNNEL_TIMEOUT, tunnel(&mut upgraded, &authority))
-                        .await;
+                    match tokio::time::timeout(TUNNEL_TIMEOUT, tunnel(&mut upgraded, &authority))
+                        .await
+                    {
+                        Ok(Ok(())) => exchange.lock().unwrap().finish(),
+                        Ok(Err(error)) => exchange
+                            .lock()
+                            .unwrap()
+                            .fail(format!("Tunnel failed: {error}")),
+                        Err(_) => exchange.lock().unwrap().fail("Tunnel timed out"),
+                    }
+                    pending.disarm();
                     return;
                 }
 
@@ -122,6 +152,10 @@ pub(crate) async fn serve_mitm_session(
                 {
                     Ok(Ok(stream)) => stream,
                     Ok(Err(error)) => {
+                        exchange
+                            .lock()
+                            .unwrap()
+                            .fail(format!("TLS handshake failed: {error}"));
                         if error.kind() == std::io::ErrorKind::UnexpectedEof {
                             log::debug!(
                                 "TLS handshake failed for {}: connection closed",
@@ -133,12 +167,15 @@ pub(crate) async fn serve_mitm_session(
                         return;
                     }
                     Err(_) => {
+                        exchange.lock().unwrap().fail("TLS handshake timed out");
                         log::debug!("TLS handshake timed out for {}", authority);
                         return;
                     }
                 };
 
                 let io = TokioIo::new(tls_stream);
+                exchange.lock().unwrap().finish();
+                pending.disarm();
 
                 let service = service_fn(move |req| {
                     serve(
@@ -151,6 +188,7 @@ pub(crate) async fn serve_mitm_session(
                         statistics.clone(),
                         client_ip_address,
                         session_cancellation.clone(),
+                        capture.clone(),
                     )
                 });
 
@@ -181,6 +219,7 @@ pub(crate) async fn serve_mitm_session(
             statistics,
             client_ip_address,
             cancellation,
+            capture,
         )
         .await
     }

@@ -21,7 +21,7 @@ static NON_EMPTY_LINE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\S"#).unwrap(
 pub struct ResourceProperties {
     pub name: String,
     pub alias: Vec<String>,
-    pub data: Option<String>,
+    pub _data: Option<String>,
 }
 
 /// The deserializable represenation of the `alias` field of a resource's properties, which can
@@ -127,7 +127,7 @@ pub fn read_redirectable_resource_mapping(mapfile_data: &str) -> Vec<ResourcePro
                 Some(ResourceProperties {
                     name,
                     alias: props.alias.map(|a| a.into_vec()).unwrap_or_default(),
-                    data: props.data,
+                    _data: props.data,
                 })
             }
         })

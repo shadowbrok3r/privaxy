@@ -1,0 +1,10 @@
+[package]
+name = "privaxy-diagnostics"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Bounded, persistent diagnostic logging for Privaxy desktop and Android"
+
+[dependencies]
+chrono = "0.4"
+log = { version = "0.4", features = ["std"] }

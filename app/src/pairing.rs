@@ -111,6 +111,7 @@ impl Identity {
         let listener = tokio::net::TcpListener::bind(LISTEN_ADDRESS)
             .await
             .map_err(|e| e.to_string())?;
+        log::info!("Android relay listening on {LISTEN_ADDRESS}");
         *status.lock().unwrap() =
             format!("Listening on {LISTEN_ADDRESS} (encrypted, paired clients only)");
         self.serve_on(listener, "127.0.0.1:8100".parse().unwrap(), connections)
@@ -141,8 +142,10 @@ impl Identity {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
             while tasks.try_join_next().is_some() {}
-            let (tcp, _) = listener.accept().await.map_err(|e| e.to_string())?;
+            let (tcp, peer) = listener.accept().await.map_err(|e| e.to_string())?;
+            log::debug!("Relay TCP accepted peer={peer}");
             let Ok(permit) = limit.clone().try_acquire_owned() else {
+                log::warn!("Relay connection limit reached peer={peer}");
                 continue;
             };
             let acceptor = acceptor.clone();
@@ -151,9 +154,15 @@ impl Identity {
             tasks.spawn(async move {
                 let _permit = permit;
                 let handshake = async {
-                    let mut tls = acceptor.accept(tcp).await?;
+                    let mut tls = acceptor
+                        .accept(tcp)
+                        .await
+                        .map_err(|e| std::io::Error::other(format!("TLS handshake: {e}")))?;
+                    log::debug!("Relay TLS ready peer={peer}");
                     let mut received = [0; 64];
-                    tls.read_exact(&mut received).await?;
+                    tls.read_exact(&mut received).await.map_err(|e| {
+                        std::io::Error::other(format!("Pairing authentication read: {e}"))
+                    })?;
                     let difference = received
                         .iter()
                         .zip(token.bytes())
@@ -165,16 +174,39 @@ impl Identity {
                     let local = if status_only {
                         None
                     } else {
-                        Some(tokio::net::TcpStream::connect(upstream).await?)
+                        Some(
+                            tokio::net::TcpStream::connect(upstream)
+                                .await
+                                .map_err(|e| {
+                                    std::io::Error::other(format!("Local proxy {upstream}: {e}"))
+                                })?,
+                        )
                     };
                     tls.write_all(b"OK").await?;
+                    log::debug!("Relay authenticated peer={peer} status_channel={status_only}");
                     Ok::<_, std::io::Error>((tls, local))
                 };
-                if let Ok(Ok((mut tls, local))) =
-                    tokio::time::timeout(std::time::Duration::from_secs(15), handshake).await
+                let (mut tls, local) =
+                    match tokio::time::timeout(std::time::Duration::from_secs(15), handshake).await
+                    {
+                        Ok(Ok(value)) => value,
+                        Ok(Err(error)) => {
+                            log::warn!("Relay handshake failed peer={peer}: {error}");
+                            return;
+                        }
+                        Err(_) => {
+                            log::warn!("Relay handshake timed out peer={peer}");
+                            return;
+                        }
+                    };
                 {
                     if let Some(mut local) = local {
-                        let _ = tokio::io::copy_bidirectional(&mut tls, &mut local).await;
+                        match tokio::io::copy_bidirectional(&mut tls, &mut local).await {
+                            Ok((up, down)) => log::debug!(
+                                "Relay stream closed peer={peer} uploaded={up} downloaded={down}"
+                            ),
+                            Err(error) => log::warn!("Relay stream failed peer={peer}: {error}"),
+                        }
                     } else {
                         // A separate authenticated heartbeat proves pairing without counting
                         // ordinary short-lived HTTP streams as phone connections.
@@ -187,14 +219,24 @@ impl Identity {
                                 tls.write_all(b"P").await?;
                                 tls.flush().await
                             };
-                            if !matches!(
-                                tokio::time::timeout(std::time::Duration::from_secs(12), heartbeat)
-                                    .await,
-                                Ok(Ok(()))
-                            ) {
-                                break;
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(12),
+                                heartbeat,
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => log::trace!("Phone heartbeat peer={peer}"),
+                                Ok(Err(error)) => {
+                                    log::info!("Phone disconnected peer={peer}: {error}");
+                                    break;
+                                }
+                                Err(_) => {
+                                    log::warn!("Phone heartbeat timed out peer={peer} after 12s");
+                                    break;
+                                }
                             }
                             if connected.is_none() {
+                                log::info!("Phone connected and pairing verified peer={peer}");
                                 connections.active.fetch_add(1, Ordering::Relaxed);
                                 connections.verified.store(true, Ordering::Relaxed);
                                 connected = Some(Connected(connections.clone()));

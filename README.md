@@ -25,11 +25,33 @@ pinned in `app/Cargo.toml`. The default desktop UI includes custom window chrome
 and the theme preset picker under Settings. The previous Dioxus UI remains available with
 `cargo run -p privaxy-app --features legacy --bin privaxy-legacy`.
 
-The title bar has three pages: **Dashboard**, **Traffic**, and **Settings**.
+The title bar has **Dashboard**, **Traffic**, **Settings**, and **Logs**.
 Dashboard combines proxy controls, filtering, Android connection status, a live
-request chart, top destinations, and recent requests. Traffic provides the full
-searchable log; Settings contains appearance, filter lists, custom rules, and
-HTTPS exclusions.
+request chart, top destinations, and recent requests. Settings contains appearance,
+filter lists, custom rules, and HTTPS exclusions.
+
+Traffic uses the Git-pinned egui-data-table and egui_json_tree forks. Click a request
+to open its docked inspector; drag the divider to resize it. Right-click a column
+header to hide/show columns, drag headers to reorder, or drag borders to resize.
+Search and sort the table, filter failures/blocked requests, or include CONNECT
+handshakes (hidden initially). Request/response views include headers, duplicate
+header values, bodies, timing, client, status and capture errors. JSON has a
+collapsible searchable tree and formatted copy; text/hex bodies use 64 KiB pages.
+Complete JSON up to 8 MiB uses the tree; larger bodies remain available through
+paging and full body export. Capture retains up to 5,000 requests and 512 MiB of
+body data per session; reaching a limit is explicit and does not stop forwarding.
+Clear session releases the capture and begins a fresh one. TLS passthrough and
+upgraded protocol frames are labelled as not decoded.
+
+**Logs** provides Error/Warn/Info/Debug/Trace capture levels, search, pause, copy
+and export. The level persists across restarts. Debug records connection stages;
+Trace adds heartbeat timing. Desktop writes private files to the OS cache directory
+(`~/.cache/privaxy/logs/desktop.log` on Linux), rotating two 5 MiB files. Export
+includes both files, including previous runs. Android provides the same controls
+under **Settings → Diagnostic logs**, also reachable from Pairing, and exports to
+Downloads. Pairing credentials, headers and body payloads are not diagnostic events;
+connection endpoints and errors are included. A bounded queue reports any dropped
+file lines in the UI/export instead of blocking network workers.
 
 For desktop use, the proxy starts automatically on `127.0.0.1:8100`. Choose
 **Connect this computer** on Dashboard for browser/system setup and CA export.

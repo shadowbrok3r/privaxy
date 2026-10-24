@@ -3,14 +3,17 @@ use egui_theme_kit::{chrome, picker, store::JsonDirStore, title_bar::TitleBar};
 use privaxy::{PrivaxyServer, events::Event, listener::ListenerStatus};
 use std::sync::{Arc, Mutex};
 mod dashboard;
+mod diagnostics;
 mod network;
 mod pairing;
+mod traffic;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Dashboard,
     Traffic,
     Settings,
+    Logs,
 }
 
 struct App {
@@ -18,15 +21,13 @@ struct App {
     runtime: tokio::runtime::Runtime,
     server: Arc<Mutex<Option<PrivaxyServer>>>,
     startup_error: Arc<Mutex<Option<String>>>,
-    events: Arc<Mutex<std::collections::VecDeque<Event>>>,
     config: Arc<Mutex<Option<privaxy::configuration::Configuration>>>,
     chrome: chrome::Chrome,
     store: Arc<JsonDirStore>,
     picker: picker::PickerState,
     tab: Tab,
-    query: String,
-    traffic_filter: u8,
-    selected_event: Option<Event>,
+    traffic: traffic::Traffic,
+    logs: diagnostics::LogView,
     custom: String,
     exclusions: String,
     drafts_loaded: bool,
@@ -58,15 +59,13 @@ impl App {
             runtime: tokio::runtime::Runtime::new().unwrap(),
             server: Arc::default(),
             startup_error: Arc::default(),
-            events: Arc::default(),
             config: Arc::default(),
             chrome,
             store,
             picker: Default::default(),
             tab: Tab::Dashboard,
-            query: String::new(),
-            traffic_filter: 0,
-            selected_event: None,
+            traffic: Default::default(),
+            logs: Default::default(),
             custom: String::new(),
             exclusions: String::new(),
             drafts_loaded: false,
@@ -87,9 +86,8 @@ impl App {
     }
     fn initialize_backend(&self) {
         *self.startup_error.lock().unwrap() = None;
-        let (server, events, config, error) = (
+        let (server, config, error) = (
             self.server.clone(),
-            self.events.clone(),
             self.config.clone(),
             self.startup_error.clone(),
         );
@@ -97,30 +95,17 @@ impl App {
             let backend = match privaxy::try_start_privaxy().await {
                 Ok(backend) => backend,
                 Err(reason) => {
+                    log::error!("Proxy initialization failed: {reason}");
                     *error.lock().unwrap() = Some(reason);
                     return;
                 }
             };
-            let mut rx = backend.requests_broadcast_sender.subscribe();
             *server.lock().unwrap() = Some(backend);
             match privaxy::configuration::Configuration::read_from_home(reqwest::Client::new())
                 .await
             {
                 Ok(cfg) => *config.lock().unwrap() = Some(cfg),
                 Err(reason) => *error.lock().unwrap() = Some(reason.to_string()),
-            }
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        let mut rows = events.lock().unwrap();
-                        rows.push_back(event);
-                        while rows.len() > 5000 {
-                            rows.pop_front();
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(_) => break,
-                }
             }
         });
     }
@@ -148,11 +133,13 @@ impl App {
         let (status, connections) = (self.relay_status.clone(), self.connections.clone());
         self.relay = Some(self.runtime.spawn(async move {
             if let Err(e) = identity.serve(status.clone(), connections).await {
+                log::error!("Android relay failed: {e}");
                 *status.lock().unwrap() = e;
             }
         }));
     }
     fn stop_relay(&mut self) {
+        log::info!("Android relay stop requested");
         if let Some(task) = self.relay.take() {
             task.abort();
         }
@@ -241,6 +228,7 @@ impl eframe::App for App {
                         (Tab::Dashboard, "Dashboard"),
                         (Tab::Traffic, "Traffic"),
                         (Tab::Settings, "Settings"),
+                        (Tab::Logs, "Logs"),
                     ] {
                         ui.selectable_value(&mut self.tab, tab, label);
                     }
@@ -289,7 +277,10 @@ impl eframe::App for App {
                     });
                     ui.add_space(8.);
                 }
-                let events: Vec<_> = self.events.lock().unwrap().iter().cloned().collect();
+                let events = server
+                    .as_ref()
+                    .map(|server| server.capture.events())
+                    .unwrap_or_default();
                 match self.tab {
                     Tab::Dashboard => {
                         egui::ScrollArea::vertical()
@@ -297,7 +288,11 @@ impl eframe::App for App {
                             .show(ui, |ui| self.dashboard(ui, server.as_ref(), &events))
                             .inner
                     }
-                    Tab::Traffic => self.traffic(ui, &events),
+                    Tab::Traffic => {
+                        self.traffic
+                            .show(ui, server.as_ref(), &events, self.notice.clone())
+                    }
+                    Tab::Logs => self.logs.show(ui, self.notice.clone()),
                     Tab::Settings => {
                         egui::ScrollArea::vertical()
                             .id_salt("settings")
@@ -319,7 +314,18 @@ impl eframe::App for App {
     }
 }
 fn main() -> eframe::Result {
-    env_logger::init();
+    let _ = privaxy_diagnostics::init(None);
+    let logs = dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("privaxy/logs/desktop.log");
+    if let Err(error) = privaxy_diagnostics::attach_file(&logs) {
+        log::error!("Cannot open diagnostic log: {error}");
+    }
+    log::info!(
+        "Privaxy desktop {} starting on {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS
+    );
     let _ = rustls::crypto::ring::default_provider().install_default();
     let chrome = chrome::resolve_from_process("privaxy");
     let viewport = chrome::viewport(

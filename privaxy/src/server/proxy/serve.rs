@@ -1,15 +1,21 @@
-use super::mitm::BoxBodyType;
-use crate::blocker::AdblockRequester;
-use crate::events::Event;
-use crate::statistics::Statistics;
+use super::mitm::{BodyError, BoxBodyType};
+use crate::{
+    blocker::AdblockRequester,
+    body::CaptureBody,
+    capture::{CaptureStore, Exchange, PendingResponse, header_pairs},
+    events::Event,
+    statistics::Statistics,
+};
 use adblock::blocker::BlockerResult;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use http::uri::{Authority, Scheme};
 use http::{StatusCode, Uri};
-use http_body_util::{BodyExt, Empty, Full};
-use hyper::Request;
-use hyper::Response;
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Empty, Full, StreamBody};
+use hyper::{
+    Request, Response,
+    body::{Frame, Incoming},
+};
 use std::net::IpAddr;
 use tokio::sync::broadcast;
 
@@ -18,11 +24,34 @@ fn empty_body() -> BoxBodyType {
         .map_err(|never| match never {})
         .boxed()
 }
-
 fn full_body<T: Into<Bytes>>(chunk: T) -> BoxBodyType {
     Full::new(chunk.into())
         .map_err(|never| match never {})
         .boxed()
+}
+
+fn strip_hop_headers(headers: &mut http::HeaderMap) {
+    let nominated: Vec<String> = headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|name| name.trim().to_owned())
+        .collect();
+    for name in nominated {
+        headers.remove(name);
+    }
+    for name in [
+        "connection",
+        "proxy-connection",
+        "keep-alive",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        headers.remove(name);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -36,153 +65,186 @@ pub(crate) async fn serve(
     statistics: Statistics,
     client_ip_address: IpAddr,
     cancellation: tokio_util::sync::CancellationToken,
+    capture: CaptureStore,
 ) -> Result<Response<BoxBodyType>, hyper::Error> {
-    // Check if this is a direct request to the proxy itself (not a proxy request)
-    // This happens with PAC file checks, WPAD, or direct browser access
-    let is_direct_proxy_request = authority.host() == "127.0.0.1"
-        || authority.host() == "localhost"
-        || authority.host() == "::1";
-
-    if is_direct_proxy_request && authority.port_u16() == Some(8100) {
-        // Return a simple status page for direct requests to the proxy
+    let is_direct = matches!(authority.host(), "127.0.0.1" | "localhost" | "::1");
+    if is_direct && authority.port_u16() == Some(8100) {
         return Ok(get_proxy_status_page());
     }
-
     let scheme_string = scheme.to_string();
-
     let uri = match http::uri::Builder::new()
         .scheme(scheme)
         .authority(authority)
-        .path_and_query(match request.uri().path_and_query() {
-            Some(path_and_query) => path_and_query.as_str(),
-            None => "/",
-        })
+        .path_and_query(request.uri().path_and_query().map_or("/", |p| p.as_str()))
         .build()
     {
         Ok(uri) => uri,
-        Err(_err) => {
-            return Ok(get_empty_response(http::StatusCode::BAD_REQUEST));
-        }
+        Err(_) => return Ok(get_empty_response(StatusCode::BAD_REQUEST)),
     };
-
-    if request.headers().contains_key(http::header::UPGRADE) {
-        return Ok(perform_two_ends_upgrade(request, uri, client, cancellation).await);
-    }
-
-    let (parts, body) = request.into_parts();
-    let method = parts.method.clone();
-    let headers = parts.headers.clone();
-    let request_uri = uri.clone();
-
-    log::debug!("{} {}", method, request_uri);
-
-    statistics.increment_top_clients(client_ip_address);
-
-    let (is_request_blocked, blocker_result) = adblock_requester
+    let headers = request.headers().clone();
+    let method = request.method().clone();
+    let is_head = method == http::Method::HEAD;
+    let (blocked, blocker_result) = adblock_requester
         .is_network_url_blocked(
             uri.to_string(),
-            match headers.get(http::header::REFERER) {
-                Some(referer) => referer.to_str().unwrap().to_string(),
-                // When no referer, we default to `uri` as we otherwise may get many false
-                // positives due to the blocker thinking it's third party requests.
-                None => uri.to_string(),
-            },
+            headers
+                .get(http::header::REFERER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+                .unwrap_or_else(|| uri.to_string()),
         )
         .await;
+    let mut details = Exchange::default();
+    details.request_headers = header_pairs(&headers);
+    details.request_version = request.version();
+    details.client = client_ip_address;
+    let event = capture.begin(method.to_string(), uri.to_string(), blocked, details);
+    log::debug!(
+        "HTTP id={} method={} host={} blocked={blocked}",
+        event.id,
+        method,
+        uri.host().unwrap_or_default()
+    );
+    let exchange = event.exchange.clone();
+    let _ = broadcast_sender.send(event);
+    let mut pending = PendingResponse(Some(exchange.clone()));
+    statistics.increment_top_clients(client_ip_address);
 
-    let _result = broadcast_sender.send(Event {
-        now: chrono::Utc::now(),
-        method: method.to_string(),
-        url: request_uri.to_string(),
-        is_request_blocked,
-    });
-
-    if is_request_blocked {
-        statistics.increment_blocked_requests();
-        statistics.increment_top_blocked_paths(format!(
-            "{}://{}{}",
-            scheme_string,
-            uri.host().unwrap(),
-            uri.path()
-        ));
-
-        log::debug!("Blocked request: {}", uri);
-
-        return Ok(get_blocked_by_privaxy_response(blocker_result));
-    }
-
-    let mut request_headers = headers.clone();
-    request_headers.remove(http::header::CONNECTION);
-    request_headers.remove(http::header::HOST);
-
-    // Collect the request body
-    let body_bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => Bytes::new(),
-    };
-
-    let response = match client
-        .request(method, uri.to_string())
-        .headers(request_headers)
-        .body(body_bytes)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(err) => return Ok(get_informative_error_response(&err.to_string())),
-    };
-
-    statistics.increment_proxied_requests();
-
-    let response_status = response.status();
-    let response_headers = response.headers().clone();
-
-    // Collect the response body
-    let response_bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            log::debug!("Failed to read response body: {}", err);
-            return Ok(get_informative_error_response(&err.to_string()));
+    let response = async {
+        if !blocked && headers.contains_key(http::header::UPGRADE) {
+            exchange.lock().unwrap().note = Some(
+                "Protocol upgrade: HTTP handshake captured; upgraded frames are not decoded."
+                    .into(),
+            );
+            return perform_two_ends_upgrade(request, uri, client, cancellation).await;
         }
-    };
-
-    // Check if we need to rewrite HTML
-    if let Some(content_type) = response_headers.get(http::header::CONTENT_TYPE) {
-        if let Ok(value) = content_type.to_str() {
-            if value.contains("text/html") {
-                // Use the rewriter synchronously with collected body
-                let rewritten_body = rewrite_html(
-                    uri.to_string(),
-                    response_bytes,
-                    adblock_requester,
-                    statistics,
-                )
-                .await;
-
-                let mut new_response = Response::builder()
-                    .status(response_status)
-                    .body(full_body(rewritten_body))
-                    .unwrap();
-
-                // Copy headers but remove content-length since we may have modified the body
-                let mut headers = response_headers;
-                headers.remove(http::header::CONTENT_LENGTH);
-                headers.remove(http::header::TRANSFER_ENCODING);
-                *new_response.headers_mut() = headers;
-
-                return Ok(new_response);
+        let (_, body) = request.into_parts();
+        let body = CaptureBody::new(body, exchange.clone(), true);
+        if blocked {
+            statistics.increment_blocked_requests();
+            statistics.increment_top_blocked_paths(format!(
+                "{}://{}{}",
+                scheme_string,
+                uri.host().unwrap_or_default(),
+                uri.path()
+            ));
+            // Preserve the received request body even when the filter rejects the request.
+            if let Err(error) = body.collect().await {
+                exchange
+                    .lock()
+                    .unwrap()
+                    .fail(format!("Request body failed: {error}"));
+            }
+            return get_blocked_by_privaxy_response(blocker_result);
+        }
+        let mut request_headers = headers;
+        strip_hop_headers(&mut request_headers);
+        request_headers.remove(http::header::HOST);
+        let mut response = match client
+            .request(method, uri.to_string())
+            .headers(request_headers)
+            .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let error = error.without_url();
+                log::warn!("Upstream request failed: {error}");
+                exchange
+                    .lock()
+                    .unwrap()
+                    .fail(format!("Upstream request failed: {error}"));
+                return get_informative_error_response(&error.to_string());
+            }
+        };
+        statistics.increment_proxied_requests();
+        let status = response.status();
+        let mut headers = response.headers().clone();
+        exchange
+            .lock()
+            .unwrap()
+            .response(status.as_u16(), response.version(), &headers);
+        strip_hop_headers(&mut headers);
+        if is_head {
+            let mut response = Response::new(empty_body());
+            *response.status_mut() = status;
+            *response.headers_mut() = headers;
+            return response;
+        }
+        let html = headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.to_ascii_lowercase().contains("text/html"));
+        // Only small HTML documents need buffering for cosmetic rewriting. Everything else,
+        // including SSE and large/binary downloads, is forwarded and captured incrementally.
+        const MAX_REWRITE: usize = 1024 * 1024;
+        let mut prefix = Vec::new();
+        if html {
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        prefix.extend_from_slice(&chunk);
+                        if prefix.len() > MAX_REWRITE {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        let rewritten = rewrite_html(
+                            uri.to_string(),
+                            Bytes::from(prefix),
+                            adblock_requester,
+                            statistics,
+                        )
+                        .await;
+                        headers.remove(http::header::CONTENT_LENGTH);
+                        let mut response = Response::new(full_body(rewritten));
+                        *response.status_mut() = status;
+                        *response.headers_mut() = headers;
+                        return response;
+                    }
+                    Err(error) => {
+                        exchange
+                            .lock()
+                            .unwrap()
+                            .fail(format!("Upstream response body failed: {error}"));
+                        return get_informative_error_response(&error.to_string());
+                    }
+                }
             }
         }
+        let first = futures_util::stream::iter(
+            (!prefix.is_empty()).then(|| Ok::<_, BodyError>(Frame::data(Bytes::from(prefix)))),
+        );
+        let rest = response.bytes_stream().map(|chunk| {
+            chunk
+                .map(Frame::data)
+                .map_err(|e| -> BodyError { Box::new(e) })
+        });
+        let body = BodyExt::boxed(StreamBody::new(first.chain(rest)));
+        let mut response = Response::new(body);
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        response
     }
+    .await;
 
-    // For non-HTML responses, return the collected body directly
-    let mut new_response = Response::builder()
-        .status(response_status)
-        .body(full_body(response_bytes))
-        .unwrap();
-
-    *new_response.headers_mut() = response_headers;
-    Ok(new_response)
+    exchange.lock().unwrap().response(
+        response.status().as_u16(),
+        response.version(),
+        response.headers(),
+    );
+    log::debug!(
+        "HTTP response status={} client={}",
+        response.status(),
+        exchange.lock().unwrap().client
+    );
+    pending.disarm();
+    let (parts, body) = response.into_parts();
+    Ok(Response::from_parts(
+        parts,
+        CaptureBody::new(body, exchange, false).boxed(),
+    ))
 }
 
 async fn rewrite_html(
@@ -441,4 +503,184 @@ async fn perform_two_ends_upgrade(
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .body(empty_body())
         .unwrap()
+}
+
+#[cfg(test)]
+mod inspection_tests {
+    use super::*;
+    use crate::blocker::{BlockerRequest, BlockerResult as Decision};
+    use hyper::{server::conn::http1, service::service_fn};
+    use hyper_util::rt::TokioIo;
+    use std::{
+        convert::Infallible,
+        sync::{Arc, Mutex},
+    };
+    use tokio::{net::TcpListener, sync::oneshot};
+
+    #[tokio::test]
+    async fn captures_exact_upload_download_and_streams_before_completion() {
+        let (sender, receiver) = crossbeam_channel::unbounded::<BlockerRequest>();
+        let blocker = std::thread::spawn(move || {
+            while let Ok(request) = receiver.recv() {
+                let _ = request
+                    .respond_to
+                    .send(Decision::Network(BlockerResult::default()));
+            }
+        });
+        let requester = AdblockRequester::new(sender);
+        let capture = CaptureStore::new(&std::env::temp_dir().join("privaxy-http-test")).unwrap();
+        let (release, pending) = oneshot::channel::<()>();
+        let pending = Arc::new(Mutex::new(Some(pending)));
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                let (tcp, _) = origin.accept().await.unwrap();
+                let pending = pending.clone();
+                tasks.spawn(async move {
+                    let _ = http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(tcp),
+                            service_fn(move |request: Request<Incoming>| {
+                                let pending = pending.clone();
+                                async move {
+                                    let response = if request.uri().path() == "/stream" {
+                                        let pending = pending.lock().unwrap().take().unwrap();
+                                        let stream = futures_util::stream::once(async {
+                                            Ok::<_, Infallible>(Frame::data(Bytes::from_static(
+                                                b"first\n",
+                                            )))
+                                        })
+                                        .chain(futures_util::stream::once(async move {
+                                            pending.await.unwrap();
+                                            Ok(Frame::data(Bytes::from_static(b"last\n")))
+                                        }));
+                                        Response::builder()
+                                            .header("content-type", "text/event-stream")
+                                            .body(BodyExt::boxed(
+                                                StreamBody::new(stream)
+                                                    .map_err(|never| match never {}),
+                                            ))
+                                            .unwrap()
+                                    } else {
+                                        let data =
+                                            request.into_body().collect().await.unwrap().to_bytes();
+                                        Response::builder()
+                                            .status(201)
+                                            .header("content-type", "application/octet-stream")
+                                            .header("x-duplicate", "one")
+                                            .header("x-duplicate", "two")
+                                            .header("content-length", data.len())
+                                            .body(full_body(data))
+                                            .unwrap()
+                                    };
+                                    Ok::<_, Infallible>(response)
+                                }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let capture_server = capture.clone();
+        let proxy = tokio::spawn(async move {
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let (events, _) = broadcast::channel(10);
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                let (tcp, addr) = listener.accept().await.unwrap();
+                let requester = requester.clone();
+                let client = client.clone();
+                let events = events.clone();
+                let capture = capture_server.clone();
+                tasks.spawn(async move {
+                    let _ = http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(tcp),
+                            service_fn(move |request: Request<Incoming>| {
+                                let authority = request.uri().authority().unwrap().clone();
+                                serve(
+                                    requester.clone(),
+                                    request,
+                                    client.clone(),
+                                    authority,
+                                    Scheme::HTTP,
+                                    events.clone(),
+                                    Statistics::new(),
+                                    addr.ip(),
+                                    Default::default(),
+                                    capture.clone(),
+                                )
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_address}")).unwrap())
+            .build()
+            .unwrap();
+        let payload: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let response = client
+            .post(format!("http://{origin_address}/echo"))
+            .body(payload.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), payload);
+        let event = capture.events().remove(0);
+        let details = event.exchange.lock().unwrap();
+        assert_eq!(details.status, Some(201));
+        assert!(details.request_complete && details.finished_at.is_some());
+        assert!(details.error.is_none(), "{:?}", details.error);
+        assert_eq!(
+            details
+                .response_headers
+                .iter()
+                .filter(|(key, _)| key == "x-duplicate")
+                .count(),
+            2
+        );
+        for body in [&details.request_body, &details.response_body] {
+            assert!(body.snapshot().error.is_none());
+            assert_eq!(
+                body.snapshot().read_range(0, payload.len()).unwrap(),
+                payload
+            );
+        }
+        drop(details);
+        let mut response = client
+            .get(format!("http://{origin_address}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), response.chunk())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, "first\n");
+        let stream = capture.events().remove(1);
+        assert!(stream.exchange.lock().unwrap().finished_at.is_none());
+        release.send(()).unwrap();
+        assert_eq!(response.bytes().await.unwrap(), "last\n");
+        let details = stream.exchange.lock().unwrap();
+        assert!(details.finished_at.is_some());
+        assert!(details.error.is_none());
+        assert_eq!(
+            details.response_body.snapshot().read_range(0, 64).unwrap(),
+            b"first\nlast\n"
+        );
+        drop(details);
+        proxy.abort();
+        origin_task.abort();
+        let _ = proxy.await;
+        let _ = origin_task.await;
+        blocker.join().unwrap();
+    }
 }

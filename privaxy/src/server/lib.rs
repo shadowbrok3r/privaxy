@@ -15,19 +15,23 @@ use tokio::sync::broadcast;
 
 pub mod blocker;
 mod blocker_utils;
+mod body;
 mod ca;
+pub mod capture;
 mod cert;
 pub mod configuration;
 pub mod events;
 pub mod listener;
 mod proxy;
 pub mod statistics;
+pub mod storage;
 
 // Shorter timeout for idle connections
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct PrivaxyServer {
+    pub capture: capture::CaptureStore,
     pub listener: listener::ProxyListener,
     pub ca_certificate_pem: String,
     pub configuration_updater_sender: tokio::sync::mpsc::Sender<configuration::Configuration>,
@@ -80,6 +84,13 @@ pub async fn try_start_privaxy() -> Result<PrivaxyServer, String> {
     let ca_private_key = configuration.ca_private_key().map_err(|e| e.to_string())?;
 
     let cert_cache = cert::CertCache::new(ca_certificate, ca_private_key);
+    let capture = capture::CaptureStore::new(
+        &dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("privaxy/captures"),
+    )
+    .map_err(|error| format!("Cannot create capture storage: {error}"))?;
+    let capture_for_server = capture.clone();
 
     let statistics = statistics::Statistics::new();
     let statistics_clone = statistics.clone();
@@ -130,6 +141,7 @@ pub async fn try_start_privaxy() -> Result<PrivaxyServer, String> {
             let statistics = statistics.clone();
             let blocker_requester = blocker_requester.clone();
             let local_exclusion_store = local_exclusion_store.clone();
+            let capture = capture_for_server.clone();
             async move {
                 let service = service_fn(move |req| {
                     proxy::serve_mitm_session(
@@ -142,6 +154,7 @@ pub async fn try_start_privaxy() -> Result<PrivaxyServer, String> {
                         client_addr.ip(),
                         local_exclusion_store.clone(),
                         cancellation.clone(),
+                        capture.clone(),
                     )
                 });
                 let result = tokio::time::timeout(
@@ -162,6 +175,7 @@ pub async fn try_start_privaxy() -> Result<PrivaxyServer, String> {
     );
 
     Ok(PrivaxyServer {
+        capture,
         listener,
         ca_certificate_pem,
         configuration_updater_sender: configuration_updater_tx,
