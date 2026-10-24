@@ -32,8 +32,8 @@ chrono = { version = "0.4", features = ["serde"] }
 # HTTP client
 reqwest = { version = "0.12", features = ["rustls-tls", "json"] }
 
-# File dialogs (use xdg-portal with tokio)
-rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "tokio"] }
+# Native file dialogs share the runtime-independent backend used by egui-theme-kit.
+rfd = "0.17"
 
 # Privaxy core library
 privaxy = { path = "../privaxy" }
