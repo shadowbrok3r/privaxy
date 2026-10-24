@@ -21,6 +21,7 @@ struct App {
     identity: Option<pairing::Identity>,
     relay: Option<tokio::task::JoinHandle<()>>,
     relay_status: Arc<Mutex<String>>,
+    connections: Arc<pairing::Connections>,
     host: String,
     addresses: network::Addresses,
     notice: Arc<Mutex<String>>,
@@ -80,28 +81,26 @@ impl App {
             drafts_loaded: false,
             identity: identity.ok(),
             relay: None,
+            connections: Arc::default(),
             relay_status: Arc::new(Mutex::new("Disabled".into())),
             host,
             addresses,
             notice: Arc::new(Mutex::new(notice)),
         }
     }
+    fn connection_label(&self) -> String {
+        let count = self.connections.count();
+        if count > 0 {
+            format!("● Android: {count} connected · paired")
+        } else if self.relay.is_some() && self.connections.verified() {
+            "○ Android: offline · paired".into()
+        } else if self.relay.is_some() {
+            "○ Android: waiting for phone".into()
+        } else {
+            "○ Android: relay off".into()
+        }
+    }
     fn content(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            for (i, label) in [
-                "Dashboard",
-                "Requests",
-                "Filters",
-                "Settings",
-                "Android pairing",
-            ]
-            .iter()
-            .enumerate()
-            {
-                ui.selectable_value(&mut self.tab, i, *label);
-            }
-        });
-        ui.separator();
         let server = self.server.lock().unwrap().clone();
         if server.is_none() {
             ui.spinner();
@@ -247,8 +246,9 @@ impl App {
                     {
                         let identity = self.identity.clone().unwrap();
                         let status = self.relay_status.clone();
+                        let connections = self.connections.clone();
                         self.relay = Some(self.runtime.spawn(async move {
-                            if let Err(e) = identity.serve(status.clone()).await {
+                            if let Err(e) = identity.serve(status.clone(), connections).await {
                                 *status.lock().unwrap() = e;
                             }
                         }));
@@ -258,6 +258,7 @@ impl App {
                     *self.relay_status.lock().unwrap() = "Disabled".into();
                 }
                 ui.label(self.relay_status.lock().unwrap().clone());
+                ui.label(self.connection_label());
                 if let Some(identity) = &self.identity {
                     match identity.code(&self.host) {
                         Ok(code) => {
@@ -269,7 +270,7 @@ impl App {
                             if ui.button("Copy pairing code").clicked() {
                                 ui.ctx().copy_text(code.clone());
                             }
-                            ui.label("Paste into Android Settings → Desktop pairing. Install the desktop inspection CA from Settings.");
+                            ui.label("Scan with the phone camera to open Privaxy → Desktop pairing, or copy this link. Tap Pair desktop on the phone. Install the desktop inspection CA from Settings.");
                             if let Ok(qr) = qrcode::QrCode::new(code.as_bytes()) {
                                 let quiet = 4;
                                 let modules = qr.width() + quiet * 2;
@@ -313,6 +314,7 @@ impl App {
                     match pairing::Identity::generate() {
                         Ok(i) => {
                             self.identity = Some(i);
+                            self.connections = Arc::default();
                             *self.relay_status.lock().unwrap() =
                                 "Pairings revoked. Enable relay and pair again.".into();
                         }
@@ -328,9 +330,43 @@ impl App {
 }
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.relay.as_ref().is_some_and(|task| task.is_finished()) {
+            self.relay = None;
+        }
         TitleBar::new("privaxy.title", "Privaxy")
             .frameless(self.chrome.frameless)
-            .show(ui, |_, _| {});
+            .show(ui, |ui, side| match side {
+                egui_theme_kit::title_bar::Side::Left => {
+                    for (i, label) in [
+                        "Dashboard",
+                        "Requests",
+                        "Filters",
+                        "Settings",
+                        "Android pairing",
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        ui.selectable_value(&mut self.tab, i, *label);
+                    }
+                }
+                egui_theme_kit::title_bar::Side::Right => {
+                    let color = if self.connections.count() > 0 {
+                        egui_theme_kit::Tokens::get(ui.ctx()).success
+                    } else {
+                        ui.visuals().weak_text_color()
+                    };
+                    if ui
+                        .selectable_label(
+                            self.tab == 4,
+                            egui::RichText::new(self.connection_label()).color(color),
+                        )
+                        .clicked()
+                    {
+                        self.tab = 4;
+                    }
+                }
+            });
         egui::CentralPanel::default().show(ui, |ui| self.content(ui));
         picker::window(ui.ctx(), &mut self.picker, &*self.store);
         if self.chrome.frameless {
@@ -350,6 +386,7 @@ fn main() -> eframe::Result {
     let viewport = chrome::viewport(
         egui::ViewportBuilder::default()
             .with_inner_size([1100., 780.])
+            .with_min_inner_size([960., 500.])
             .with_title("Privaxy"),
         &chrome,
     );

@@ -32,10 +32,15 @@ and the theme preset picker under Settings. The previous Dioxus UI remains avail
    Tailscale address, or the same reachable LAN to use the LAN address. Enable the
    relay, which listens on all interfaces at `0.0.0.0:8101`. Pairing codes contain
    the selected address. The regular HTTP proxy stays on `127.0.0.1:8100`.
-2. Copy the pairing code, or scan the QR with a scanner and copy its text. In Android
-   Settings, use **Paste pairing code**, then **Pair desktop**.
-3. Enable **Route captured TCP traffic through desktop** and **Capture all traffic**
-   on Dashboard. Pairing and the routing preference survive Android restarts.
+2. Scan the QR with the phone camera to open Privaxy directly on **Pairing**.
+   Review the desktop address and tap **Pair desktop**. Alternatively copy the
+   link/code into **Paste pairing code**. Existing `privaxy-pair-v1:` codes still work.
+   After pairing, edit **Desktop IP or hostname** and **Relay port** on Android,
+   then **Save address** to switch networks without replacing the pinned certificate.
+3. Enable **Route captured TCP traffic through desktop**. On LAN, enable
+   **Capture all traffic** on Dashboard. With the Tailscale Android VPN, leave
+   capture off and point proxy-aware apps at `127.0.0.1:8100`. Keep Privaxy included
+   in Tailscale routing. Pairing and the routing preference survive restarts.
 4. Export the desktop inspection CA from Settings and install/trust it on clients
    requiring HTTPS inspection. Pairing's transport certificate is pinned separately;
    it does not install the inspection CA or bypass app certificate pinning.
@@ -46,10 +51,22 @@ relay is unavailable, TCP fails instead of silently bypassing it. Disable the re
 to close active paired connections, or revoke all pairings to rotate its credentials.
 The relay must be enabled again after restarting the desktop app.
 
+Navigation and connection status live in the title bar. Green **connected · paired**
+means the phone authenticated and exchanged a heartbeat over pinned TLS, even when
+there is no HTTP traffic. Android distinguishes an offline saved pairing from a
+verified live connection and retries automatically. Desktop retains verification
+for the current session; restarting it waits for the phone to authenticate again.
+Connection loss is detected within about 8 seconds on Android and 12 seconds on
+desktop; closing the app or disabling/revoking the relay closes the connection.
+
 Android permits one VPN per profile. Privaxy's **Capture all traffic** mode and
 the Tailscale Android VPN cannot run together. Use the LAN address for full-device
 capture unless the phone's network already routes to the tailnet. Tailscale pairing
 requires a reachable tailnet route; selecting the address does not create one.
+App split tunneling does not allow two Android VPN services to run together.
+Allowing Tailscale IPs through a filter cannot create a tailnet route after its VPN
+is replaced. A LAN connection, a tailnet-routing gateway, or proxy-only mode avoids
+that conflict.
 
 ## About
 
