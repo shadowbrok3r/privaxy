@@ -1,4 +1,7 @@
 //! A session table and docked inspector. Row identity is independent of filtering and sorting.
+pub(crate) mod icons;
+mod presentation;
+
 use eframe::egui::{self, RichText};
 use egui_data_table::{
     DataTable, Renderer, RowViewer,
@@ -6,6 +9,8 @@ use egui_data_table::{
 };
 use egui_json_tree::{DefaultExpand, JsonTree};
 use egui_theme_kit::Tokens;
+use icons::{svg, widgets};
+use presentation::{Code, Language, Palette};
 use privaxy::{capture::Exchange, events::Event, storage::BodySnapshot};
 use std::{
     borrow::Cow,
@@ -149,15 +154,115 @@ impl Row {
 #[derive(Default, Clone, PartialEq, Eq, Hash)]
 struct Filters {
     query: String,
-    filter: u8,
+    preset: Preset,
     tunnels: bool,
     columns: [String; 12],
 }
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, Hash)]
+enum Preset {
+    #[default]
+    All,
+    HideErrors,
+    Errors,
+    Blocked,
+    Slow,
+    Pending,
+    Json,
+}
+impl Preset {
+    const ALL: [Self; 7] = [
+        Self::All,
+        Self::HideErrors,
+        Self::Errors,
+        Self::Blocked,
+        Self::Slow,
+        Self::Pending,
+        Self::Json,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All requests",
+            Self::HideErrors => "Hide errors",
+            Self::Errors => "Errors",
+            Self::Blocked => "Blocked",
+            Self::Slow => "Slow (≥ 1 s)",
+            Self::Pending => "Pending",
+            Self::Json => "JSON responses",
+        }
+    }
+    fn icon(self) -> icons::Icon {
+        match self {
+            Self::All => svg::LIST_BULLETS,
+            Self::HideErrors => svg::SHIELD_CHECK,
+            Self::Errors => svg::WARNING_CIRCLE,
+            Self::Blocked => svg::PROHIBIT,
+            Self::Slow => svg::CLOCK,
+            Self::Pending => svg::HOURGLASS,
+            Self::Json => svg::BRACKETS_CURLY,
+        }
+    }
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::All => "All captured requests matching search and column filters.",
+            Self::HideErrors => {
+                "Hide transport failures and HTTP 4xx / 5xx responses; keep pending and successful requests."
+            }
+            Self::Errors => "Transport failures or HTTP status 400 and above.",
+            Self::Blocked => "Requests blocked by a filter rule.",
+            Self::Slow => "Requests with a recorded duration of at least 1,000 ms.",
+            Self::Pending => "Requests still waiting for a response status, excluding failures.",
+            Self::Json => "Responses with a JSON or +json content type.",
+        }
+    }
+    fn matches(self, row: &Row) -> bool {
+        let error = row.failed || row.status >= 400;
+        match self {
+            Self::All => true,
+            Self::HideErrors => !error,
+            Self::Errors => error,
+            Self::Blocked => row.event.is_request_blocked,
+            Self::Slow => row.duration >= 1000,
+            Self::Pending => row.status == 0 && !row.failed,
+            Self::Json => Language::detect(&row.values[7], "") == Language::Json,
+        }
+    }
+}
+
+/// Follow newly observed requests, without changing selection or chasing body updates.
+struct Follow {
+    enabled: bool,
+    was_enabled: bool,
+    latest: Option<u64>,
+}
+impl Default for Follow {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            was_enabled: false,
+            latest: None,
+        }
+    }
+}
+impl Follow {
+    fn update(&mut self, observed: Option<u64>, matching: Option<u64>) -> bool {
+        let new_match = matching.is_some_and(|id| self.latest.is_none_or(|seen| id > seen));
+        let scroll = self.enabled && matching.is_some() && (!self.was_enabled || new_match);
+        self.was_enabled = self.enabled;
+        // Advance through *all* observed IDs, including rows currently hidden by a filter.
+        // A later status/body update making an old row match must not count as an arrival.
+        self.latest = observed;
+        scroll
+    }
+}
+
 #[derive(Default)]
 struct Viewer {
     filters: Filters,
     body_search: crate::traffic_search::BodySearch,
     selected: Option<Event>,
+    scroll_to_end: bool,
+    chronological: bool,
 }
 impl Viewer {
     fn matches(&self, row: &Row) -> bool {
@@ -170,11 +275,7 @@ impl Viewer {
                 query.trim().is_empty()
                     || value.to_lowercase().contains(&query.trim().to_lowercase())
             })
-            && match f.filter {
-                1 => row.failed || row.status >= 400,
-                2 => row.event.is_request_blocked,
-                _ => true,
-            }
+            && f.preset.matches(row)
     }
 }
 struct Clipboard;
@@ -207,6 +308,15 @@ impl RowViewer<Row> for Viewer {
             .clip(true)
     }
     fn show_cell_view(&mut self, ui: &mut egui::Ui, row: &Row, column: usize) {
+        if std::mem::take(&mut self.scroll_to_end) {
+            // The pinned data-table does not expose TableBuilder::stick_to_bottom.
+            // Issue a one-shot public egui scroll request *inside* its virtualized body.
+            // This reaches off-screen rows without touching private table state or selection.
+            ui.scroll_with_delta_animation(
+                egui::vec2(0., -1.0e9),
+                egui::style::ScrollAnimation::none(),
+            );
+        }
         let tokens = Tokens::get(ui.ctx());
         let color = if column == 0 && row.failed {
             tokens.error
@@ -242,7 +352,7 @@ impl RowViewer<Row> for Viewer {
         self.selected = Some(row.event.clone());
     }
     fn is_sortable_column(&mut self, _: usize) -> bool {
-        true
+        !self.chronological
     }
     fn compare_cell(&self, a: &Row, b: &Row, column: usize) -> std::cmp::Ordering {
         match column {
@@ -298,7 +408,7 @@ impl RowViewer<Row> for Viewer {
         encoding.then_some(Clipboard)
     }
     fn persist_ui_state(&self) -> bool {
-        true
+        !self.chronological
     }
 }
 
@@ -318,32 +428,57 @@ enum Content {
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum Format {
     #[default]
+    Pretty,
     Json,
     Text,
     Hex,
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 struct LoadKey {
     id: u64,
     request: bool,
     length: u64,
     complete: bool,
     page: u64,
+    language: Language,
+    palette: Palette,
 }
 struct BodyView {
-    text: Option<String>,
+    text: Option<Code>,
+    hex: Code,
+}
+struct DocumentView {
     json: Option<serde_json::Value>,
     pretty: Option<String>,
-    hex: String,
+    formatted: presentation::Formatted,
 }
-struct BodyLoad {
+struct BodyLoad<T> {
     key: LoadKey,
-    rx: Option<mpsc::Receiver<Result<BodyView, String>>>,
-    value: Option<Result<BodyView, String>>,
+    rx: Option<mpsc::Receiver<Result<T, String>>>,
+    value: Option<Result<T, String>>,
+}
+impl<T> BodyLoad<T> {
+    fn poll(&mut self) {
+        if let Some(rx) = &self.rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.value = Some(result);
+                    self.rx = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.value = Some(Err("Body worker stopped".into()));
+                    self.rx = None;
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 pub(super) struct Traffic {
     table: DataTable<Row>,
+    parked_table: DataTable<Row>,
+    table_following: bool,
     viewer: Viewer,
     refreshed: Instant,
     split: f32,
@@ -352,13 +487,17 @@ pub(super) struct Traffic {
     format: Format,
     page: u64,
     search_json: String,
-    body: Option<BodyLoad>,
+    body: Option<BodyLoad<BodyView>>,
+    document: Option<BodyLoad<DocumentView>>,
     previous_selection: Option<u64>,
+    follow: Follow,
 }
 impl Default for Traffic {
     fn default() -> Self {
         Self {
             table: DataTable::new(),
+            parked_table: DataTable::new(),
+            table_following: true,
             viewer: Viewer::default(),
             refreshed: Instant::now() - Duration::from_secs(1),
             split: 0.55,
@@ -368,7 +507,9 @@ impl Default for Traffic {
             page: 0,
             search_json: String::new(),
             body: None,
+            document: None,
             previous_selection: None,
+            follow: Follow::default(),
         }
     }
 }
@@ -386,6 +527,7 @@ impl Traffic {
         events: &[Event],
         notice: Arc<Mutex<String>>,
     ) {
+        icons::install(ui.ctx());
         let old_filters = self.viewer.filters.clone();
         let mut cleared = false;
         ui.horizontal_wrapped(|ui| {
@@ -395,28 +537,52 @@ impl Traffic {
                     .char_limit(1024)
                     .desired_width(240.),
             ).on_hover_text("Search all columns, URLs, request/response headers, trailers, errors and complete captured bodies. Case-insensitive text; encrypted or uncaptured payloads cannot be searched.");
-            for (index, label) in [(0, "All"), (1, "Errors"), (2, "Blocked")] {
-                ui.selectable_value(&mut self.viewer.filters.filter, index, label);
-            }
-            ui.checkbox(&mut self.viewer.filters.tunnels, "CONNECT");
+            let preset = self.viewer.filters.preset;
+            widgets::menu_button(ui, preset.icon(), preset.label(), |ui| {
+                ui.weak("Presets combine with search and column filters.");
+                for preset in Preset::ALL {
+                    if widgets::selectable_button(ui, preset.icon(), self.viewer.filters.preset == preset, preset.label())
+                        .on_hover_text(preset.tooltip()).clicked() {
+                        self.viewer.filters.preset = preset;
+                        ui.close();
+                    }
+                }
+            }).response.on_hover_text(preset.tooltip());
             let active = self.viewer.filters.columns.iter().filter(|q| !q.trim().is_empty()).count();
-            ui.menu_button(format!("Column filters ({active})"), |ui| {
+            let filter_button = widgets::button(ui, svg::FUNNEL, format!("Column filters ({active})"))
+                .on_hover_text("Filter any column. Fields apply immediately and combine with the selected preset.");
+            egui::Popup::menu(&filter_button)
+                .id(ui.make_persistent_id("traffic_column_filter_popup"))
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| {
                 ui.label("Match every filled field, including hidden columns.");
                 egui::Grid::new("traffic_column_filters").num_columns(2).show(ui, |ui| {
                     for (column, name) in COLUMNS.iter().enumerate() {
-                        ui.label(*name);
+                        let label = ui.label(*name);
                         ui.add(egui::TextEdit::singleline(&mut self.viewer.filters.columns[column])
+                            .id_salt(("traffic_column", column))
                             .hint_text(format!("Filter {name}"))
                             .char_limit(256)
-                            .desired_width(210.));
+                            .desired_width(210.)).labelled_by(label.id);
                         ui.end_row();
                     }
                 });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if widgets::button(ui, svg::ARROW_COUNTER_CLOCKWISE, "Clear columns").clicked() {
+                        self.viewer.filters.columns = Default::default();
+                    }
+                    if widgets::button(ui, svg::CHECK_CIRCLE, "Done").clicked() { ui.close(); }
+                });
             });
-            if ui.button("Reset filters").clicked() {
+            widgets::checkbox(ui, &mut self.follow.enabled, svg::ARROW_LINE_DOWN, "Follow new requests")
+                .on_hover_text("Show requests in chronological order, oldest first, and reveal new matching arrivals. Sorting is disabled while following. Turn off to restore your manual table order; the inspector stays on your selected request.");
+            widgets::checkbox(ui, &mut self.viewer.filters.tunnels, svg::PLUGS_CONNECTED, "CONNECT")
+                .on_hover_text("Include successful HTTPS tunnel sessions. Failed tunnels remain visible unless excluded by a filter.");
+            if widgets::button(ui, svg::ARROW_COUNTER_CLOCKWISE, "Reset filters").on_hover_text("Clear search, column filters and presets.").clicked() {
                 self.viewer.filters = Filters::default();
             }
-            if ui.button("Clear session").clicked() {
+            if widgets::button(ui, svg::TRASH, "Clear session").on_hover_text("Remove all captured sessions and body files.").clicked() {
                 if let Some(server) = server {
                     if let Err(error) = server.capture.clear() {
                         *notice.lock().unwrap() = error.to_string();
@@ -426,12 +592,15 @@ impl Traffic {
                 self.table.replace(vec![]);
                 self.viewer.selected = None;
                 self.body = None;
+                self.document = None;
                 self.viewer.body_search = Default::default();
+                self.follow.latest = None;
             }
         });
         if cleared {
             return;
         }
+        self.sync_follow_order();
         if self.refreshed.elapsed() >= Duration::from_millis(350)
             || self.table.len() != events.len()
         {
@@ -455,8 +624,20 @@ impl Traffic {
             .iter()
             .filter(|row| self.viewer.matches(row))
             .count();
+        self.viewer.scroll_to_end = self.follow.update(
+            events.last().map(|event| event.id),
+            self.table
+                .iter()
+                .rev()
+                .find(|row| self.viewer.matches(row))
+                .map(|row| row.event.id),
+        );
         ui.horizontal_wrapped(|ui| {
             ui.weak(format!("{filtered} / {} sessions · {} captured", events.len(), bytes(server.map_or(0,|s|s.capture.used()))));
+            if self.follow.enabled {
+                widgets::label(ui, svg::CLOCK, "Chronological · oldest first")
+                    .on_hover_text("Follow is on. Turn it off to sort by any column.");
+            }
             if self.viewer.body_search.searching() {
                 ui.spinner();
                 ui.weak("Searching captured bodies…");
@@ -509,7 +690,11 @@ impl Traffic {
         };
         let mut table_ui = ui.new_child(
             egui::UiBuilder::new()
-                .id_salt("sessions_table")
+                .id_salt(if self.follow.enabled {
+                    "follow_sessions_table"
+                } else {
+                    "sessions_table"
+                })
                 .max_rect(table_rect),
         );
         table_ui.set_clip_rect(table_rect.intersect(ui.clip_rect()));
@@ -528,21 +713,41 @@ impl Traffic {
         ui.allocate_rect(full, egui::Sense::hover());
     }
 
+    fn sync_follow_order(&mut self) {
+        if self.table_following != self.follow.enabled {
+            // Keep the manually sorted table's opaque UI state intact. The separate follow
+            // table never loads persisted sorting and never permits sorting. Swapping back
+            // restores manual sorting/column choices; dropping its rows avoids two body indexes.
+            std::mem::swap(&mut self.table, &mut self.parked_table);
+            self.parked_table.take();
+            self.table_following = self.follow.enabled;
+            self.refreshed = Instant::now() - Duration::from_secs(1);
+        }
+        self.viewer.chronological = self.follow.enabled;
+    }
+
     fn inspector(&mut self, ui: &mut egui::Ui, event: Event, notice: Arc<Mutex<String>>) {
         if self.previous_selection != Some(event.id) {
             self.previous_selection = Some(event.id);
             self.page = 0;
             self.body = None;
+            self.document = None;
             self.search_json.clear();
         }
         let details = event.exchange.lock().unwrap().clone();
         ui.horizontal(|ui| {
             ui.strong(format!("{} · Session {}", event.method, event.id));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Close").clicked() {
+                if widgets::button(ui, svg::X_CIRCLE, "Close")
+                    .on_hover_text("Close the session inspector.")
+                    .clicked()
+                {
                     self.viewer.selected = None;
                 }
-                if ui.button("Copy URL").clicked() {
+                if widgets::button(ui, svg::COPY, "Copy URL")
+                    .on_hover_text("Copy the complete request URL.")
+                    .clicked()
+                {
                     ui.ctx().copy_text(event.url.clone());
                 }
             });
@@ -550,14 +755,18 @@ impl Traffic {
         ui.add(egui::Label::new(&event.url).truncate())
             .on_hover_text(&event.url);
         ui.horizontal(|ui| {
-            for (side, label) in [
-                (Side::Request, "Request"),
-                (Side::Response, "Response"),
-                (Side::Overview, "Overview"),
+            for (side, icon, label) in [
+                (Side::Request, svg::ARROW_UP, "Request"),
+                (Side::Response, svg::ARROW_DOWN, "Response"),
+                (Side::Overview, svg::INFO, "Overview"),
             ] {
-                if ui.selectable_value(&mut self.side, side, label).changed() {
+                if widgets::selectable_button(ui, icon, self.side == side, label).clicked()
+                    && self.side != side
+                {
+                    self.side = side;
                     self.page = 0;
                     self.body = None;
+                    self.document = None;
                 }
             }
         });
@@ -645,15 +854,27 @@ impl Traffic {
             &details.response_trailers
         };
         ui.horizontal(|ui| {
-            ui.selectable_value(
-                &mut self.content,
-                Content::Headers,
+            if widgets::selectable_button(
+                ui,
+                svg::LIST_BULLETS,
+                self.content == Content::Headers,
                 format!("Headers ({})", headers.len()),
-            );
-            ui.selectable_value(&mut self.content, Content::Body, "Body");
+            )
+            .clicked()
+            {
+                self.content = Content::Headers;
+            }
+            if widgets::selectable_button(ui, svg::FILE_CODE, self.content == Content::Body, "Body")
+                .clicked()
+            {
+                self.content = Content::Body;
+            }
         });
         if self.content == Content::Headers {
-            if ui.button("Copy headers").clicked() {
+            if widgets::button(ui, svg::COPY, "Copy headers")
+                .on_hover_text("Copy all headers and trailers.")
+                .clicked()
+            {
                 ui.ctx().copy_text(
                     headers
                         .iter()
@@ -700,6 +921,14 @@ impl Traffic {
             } else {
                 details.finished_at.is_some()
             },
+            Language::detect(
+                headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or_default(),
+                &event.url,
+            ),
             notice,
         );
     }
@@ -711,6 +940,7 @@ impl Traffic {
         snapshot: BodySnapshot,
         request: bool,
         complete: bool,
+        language: Language,
         notice: Arc<Mutex<String>>,
     ) {
         let pages = snapshot.len.div_ceil(PAGE as u64).max(1);
@@ -721,6 +951,8 @@ impl Traffic {
             length: snapshot.len,
             complete,
             page: self.page,
+            language,
+            palette: Palette::from_ui(ui),
         };
         if self
             .body
@@ -729,8 +961,10 @@ impl Traffic {
         {
             let (tx, rx) = mpsc::channel();
             let data = snapshot.clone();
+            let ctx = ui.ctx().clone();
             std::thread::spawn(move || {
                 let _ = tx.send(load_body(&data, key));
+                ctx.request_repaint();
             });
             self.body = Some(BodyLoad {
                 key,
@@ -738,31 +972,68 @@ impl Traffic {
                 value: None,
             });
         }
-        let loaded = self.body.as_mut().unwrap();
-        if let Some(rx) = &loaded.rx {
-            match rx.try_recv() {
-                Ok(result) => {
-                    loaded.value = Some(result);
-                    loaded.rx = None;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    loaded.value = Some(Err("Body reader stopped".into()));
-                    loaded.rx = None;
-                }
-                _ => {}
-            }
+        // A separate page-independent cache: a whole-document formatter must never receive
+        // a 64 KiB fragment, nor run again just because a raw/hex page changed.
+        let document_key = LoadKey { page: 0, ..key };
+        if self
+            .document
+            .as_ref()
+            .is_none_or(|d| d.key != document_key && d.rx.is_none())
+        {
+            let (tx, rx) = mpsc::channel();
+            let data = snapshot.clone();
+            let ctx = ui.ctx().clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(load_document(&data, document_key));
+                ctx.request_repaint();
+            });
+            self.document = Some(BodyLoad {
+                key: document_key,
+                rx: Some(rx),
+                value: None,
+            });
         }
+        let document = self.document.as_mut().unwrap();
+        document.poll();
+        let document_value = (document.key == document_key)
+            .then_some(document.value.as_ref())
+            .flatten();
+        let document_data = document_value.and_then(|v| v.as_ref().ok());
+        let loaded = self.body.as_mut().unwrap();
+        loaded.poll();
         ui.horizontal_wrapped(|ui| {
-            for (mode, label) in [
-                (Format::Json, "JSON"),
-                (Format::Text, "Text"),
-                (Format::Hex, "Hex"),
+            for (mode, icon, label) in [
+                (Format::Pretty, svg::CODE_BLOCK, "Pretty"),
+                (Format::Json, svg::BRACKETS_CURLY, "JSON tree"),
+                (Format::Text, svg::FILE_CODE, "Source"),
+                (Format::Hex, svg::HASH, "Hex"),
             ] {
-                ui.selectable_value(&mut self.format, mode, label);
+                if widgets::selectable_button(ui, icon, self.format == mode, label).clicked() { self.format = mode; }
             }
-            ui.weak(format!("{} received", bytes(snapshot.len)));
+            let kind = if loaded.value.as_ref().and_then(|v| v.as_ref().ok()).is_some_and(|data| data.text.is_none()) {
+                "Binary"
+            } else { language.name() };
+            ui.weak(format!("{kind} · {}", bytes(snapshot.len)));
+            let copy = widgets::button_widget(ui, svg::COPY, "Copy body");
+            if ui.add_enabled(snapshot.len > 0, copy)
+                .on_hover_text("Copy the complete captured UTF-8 body, including all pages, without formatting. Use Export body for binary data.").clicked() {
+                let body = snapshot.clone();
+                let ctx = ui.ctx().clone();
+                let notice = notice.clone();
+                std::thread::spawn(move || {
+                    let result = body.read_range(0, body.len as usize).map_err(|e| e.to_string())
+                        .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "Binary body: use Export body to save every byte.".to_owned()));
+                    *notice.lock().unwrap() = match result {
+                        Ok(text) => { ctx.copy_text(text); format!("Copied {} captured bytes.", body.len) },
+                        Err(error) => error,
+                    };
+                    ctx.request_repaint();
+                });
+            }
+            let export = widgets::button_widget(ui, svg::DOWNLOAD_SIMPLE, "Export body");
             if ui
-                .add_enabled(snapshot.len > 0, egui::Button::new("Export body"))
+                .add_enabled(snapshot.len > 0, export)
+                .on_hover_text("Save every captured byte to a file, including all pages. Source bytes are never reformatted.")
                 .clicked()
             {
                 let filename = format!(
@@ -791,8 +1062,16 @@ impl Traffic {
         }
         let Some(value) = loaded.value.as_ref() else {
             ui.spinner();
+            ui.weak("Preparing body preview…");
+            ui.ctx().request_repaint_after(Duration::from_millis(40));
             return;
         };
+        if loaded.key != key {
+            ui.spinner();
+            ui.weak("Refreshing body preview…");
+            ui.ctx().request_repaint();
+            return;
+        }
         let data = match value {
             Ok(data) => data,
             Err(error) => {
@@ -808,8 +1087,19 @@ impl Traffic {
             });
             return;
         }
-        if self.format == Format::Json
-            && let Some(json) = &data.json
+        if matches!(self.format, Format::Pretty | Format::Json) {
+            if document_value.is_none() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.weak("Preparing complete document… showing source preview.");
+                });
+                ui.ctx().request_repaint_after(Duration::from_millis(40));
+            } else if let Some(Err(error)) = document_value {
+                ui.colored_label(Tokens::get(ui.ctx()).warn, error);
+            }
+        }
+        if matches!(self.format, Format::Json | Format::Pretty)
+            && let Some(json) = document_data.and_then(|doc| doc.json.as_ref())
         {
             ui.horizontal_wrapped(|ui| {
                 ui.add(
@@ -817,8 +1107,15 @@ impl Traffic {
                         .hint_text("Find JSON keys or values")
                         .desired_width(180.),
                 );
-                if ui.button("Copy formatted JSON").clicked() {
-                    ui.ctx().copy_text(data.pretty.clone().unwrap_or_default());
+                if widgets::button(ui, svg::COPY, "Copy formatted JSON")
+                    .on_hover_text("Copy the complete formatted JSON document.")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(
+                        document_data
+                            .and_then(|doc| doc.pretty.clone())
+                            .unwrap_or_default(),
+                    );
                 }
             });
             egui::ScrollArea::both()
@@ -836,7 +1133,7 @@ impl Traffic {
                         .show(ui);
                 });
         } else {
-            if self.format == Format::Json {
+            if self.format == Format::Json && document_value.is_some() {
                 ui.weak(if snapshot.len > JSON_LIMIT {
                     "Large body: paged text view. Export preserves the complete captured body."
                 } else if !complete {
@@ -845,46 +1142,75 @@ impl Traffic {
                     "Not valid JSON; displaying text or hexadecimal bytes."
                 });
             }
-            ui.horizontal_wrapped(|ui| {
+            if self.format == Format::Pretty
+                && let Some(note) = document_data.and_then(|doc| doc.formatted.note.as_ref())
+            {
+                ui.add(
+                    egui::Label::new(RichText::new(note).color(Tokens::get(ui.ctx()).text_dim))
+                        .wrap(),
+                );
+            }
+            if self.format == Format::Hex || data.text.is_none() {
+                let tokens = Tokens::get(ui.ctx());
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak("Offset / bytes / ASCII");
+                    ui.colored_label(tokens.text_dim, "Zero");
+                    ui.colored_label(tokens.warn, "Control");
+                    ui.colored_label(tokens.secondary, "Non-ASCII");
+                    ui.colored_label(tokens.success, "Printable");
+                });
+            }
+            let code = if self.format == Format::Hex {
+                &data.hex
+            } else if self.format == Format::Pretty {
+                document_data
+                    .and_then(|doc| doc.formatted.code.as_ref())
+                    .or(data.text.as_ref())
+                    .unwrap_or(&data.hex)
+            } else {
+                data.text.as_ref().unwrap_or(&data.hex)
+            };
+            let full_document = self.format == Format::Pretty
+                && document_data.is_some_and(|doc| doc.formatted.code.is_some());
+            if full_document {
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak(format!("Complete formatted body · {} · {} lines", bytes(code.text.len() as u64), code.line_count()));
+                    if widgets::button(ui, svg::COPY, "Copy formatted body").on_hover_text("Copy the complete formatted document. Copy body and Export body preserve the original bytes.").clicked() {
+                        ui.ctx().copy_text(code.text.clone());
+                    }
+                });
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                let previous = widgets::button_widget(ui, svg::ARROW_LEFT, "Previous");
                 if ui
-                    .add_enabled(self.page > 0, egui::Button::new("Previous"))
+                    .add_enabled(self.page > 0, previous)
                     .clicked()
                 {
                     self.page -= 1;
                 }
                 ui.label(format!("Page {} / {pages}", self.page + 1));
+                let next = widgets::button_widget(ui, svg::ARROW_RIGHT, "Next");
                 if ui
-                    .add_enabled(self.page + 1 < pages, egui::Button::new("Next"))
+                    .add_enabled(self.page + 1 < pages, next)
                     .clicked()
                 {
                     self.page += 1;
                 }
-                if ui.button("Copy page").clicked() {
-                    ui.ctx().copy_text(if self.format == Format::Hex {
-                        data.hex.clone()
-                    } else {
-                        data.text.clone().unwrap_or_else(|| data.hex.clone())
-                    });
+                if widgets::button(ui, svg::COPY, "Copy page").on_hover_text("Copy this displayed preview. Copy body copies the complete captured source.").clicked() {
+                    ui.ctx().copy_text(code.text.clone());
                 }
             });
-            let text = if self.format == Format::Hex {
-                &data.hex
-            } else {
-                data.text.as_ref().unwrap_or(&data.hex)
-            };
-            egui::ScrollArea::both()
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                .id_salt(("text_body", event.id, request, self.page))
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let mut read_only = text.as_str();
-                    ui.add(
-                        egui::TextEdit::multiline(&mut read_only)
-                            .code_editor()
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(1),
-                    );
-                });
+            }
+            code.show(
+                ui,
+                (
+                    "text_body",
+                    event.id,
+                    request,
+                    if full_document { 0 } else { loaded.key.page },
+                    self.format as u8,
+                ),
+            );
         }
     }
 }
@@ -932,54 +1258,75 @@ fn load_body(snapshot: &BodySnapshot, key: LoadKey) -> Result<BodyView, String> 
         .ok()
         .filter(|s| !s.chars().any(|c| c == '\0'))
         .map(str::to_owned);
-    let hex = bytes[start..end]
-        .chunks(16)
-        .enumerate()
-        .map(|(row, chunk)| {
-            let encoded = chunk
-                .iter()
-                .map(|b| format!("{b:02x} "))
-                .collect::<String>();
-            let ascii = chunk
-                .iter()
-                .map(|&b| {
-                    if b.is_ascii_graphic() || b == b' ' {
-                        b as char
-                    } else {
-                        '.'
-                    }
-                })
-                .collect::<String>();
-            format!(
-                "{:08x}  {:48}  {}\n",
-                offset + row as u64 * 16,
-                encoded,
-                ascii
-            )
-        })
-        .collect();
-    let json = if key.complete && snapshot.error.is_none() && snapshot.len <= JSON_LIMIT {
-        let all = snapshot
-            .read_range(0, snapshot.len as usize)
-            .map_err(|e| e.to_string())?;
-        serde_json::from_slice::<serde_json::Value>(&all).ok()
-    } else {
-        None
+    let hex = Code::hex(&bytes[start..end], offset, key.palette);
+    let text = text.map(|text| Code::highlight(text, key.language, key.palette));
+    Ok(BodyView { text, hex })
+}
+
+fn load_document(snapshot: &BodySnapshot, key: LoadKey) -> Result<DocumentView, String> {
+    let fallback = |note: &str| DocumentView {
+        json: None,
+        pretty: None,
+        formatted: presentation::Formatted {
+            code: None,
+            note: Some(note.into()),
+        },
     };
-    let pretty = json
-        .as_ref()
-        .and_then(|value| serde_json::to_string_pretty(value).ok());
-    Ok(BodyView {
-        text,
-        json,
-        pretty,
-        hex,
+    if !key.complete || snapshot.error.is_some() {
+        return Ok(fallback(
+            "Incomplete body: showing source pages. Formatting starts when capture completes.",
+        ));
+    }
+    if snapshot.len > JSON_LIMIT {
+        return Ok(fallback(
+            "Body exceeds the 2 MiB formatting / 8 MiB JSON tree limits; showing source pages. Copy body / Export body preserve all captured bytes.",
+        ));
+    }
+    // The existing JSON tree keeps its 8 MiB bound. Other formatters receive at most
+    // 2 MiB, checked before parsing, and every read/parse/highlight runs on a worker.
+    let all = snapshot
+        .read_range(0, snapshot.len as usize)
+        .map_err(|e| e.to_string())?;
+    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&all) {
+        let pretty = serde_json::to_string_pretty(&json).ok();
+        return Ok(DocumentView {
+            json: Some(json),
+            pretty,
+            formatted: Default::default(),
+        });
+    }
+    if snapshot.len > presentation::FORMAT_INPUT_LIMIT as u64 {
+        return Ok(fallback(
+            "Body exceeds the 2 MiB formatting limit; showing source pages. Copy body / Export body preserve all captured bytes.",
+        ));
+    }
+    let formatted = match std::str::from_utf8(&all)
+        .ok()
+        .filter(|text| !text.contains('\0'))
+    {
+        Some(text) => presentation::prepare(text, key.language, true, key.palette),
+        None => presentation::Formatted::default(),
+    };
+    Ok(DocumentView {
+        json: None,
+        pretty: None,
+        formatted,
     })
 }
 
 #[cfg(test)]
 mod filter_tests {
     use super::*;
+
+    fn palette() -> Palette {
+        let ctx = egui::Context::default();
+        let mut palette = None;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            palette = Some(Palette::from_ui(ui))
+        });
+        output.textures_delta.clear();
+        palette.unwrap()
+    }
 
     fn sample() -> Row {
         let mut event = Row::empty().event;
@@ -1037,11 +1384,261 @@ mod filter_tests {
         viewer.filters.columns[1] = "post".into();
         viewer.filters.columns[2] = "example.test".into();
         viewer.filters.query = "response-marker".into();
-        viewer.filters.filter = 1;
+        viewer.filters.preset = Preset::Errors;
         assert!(viewer.matches(&row));
-        viewer.filters.filter = 2;
+        viewer.filters.preset = Preset::Blocked;
         assert!(!viewer.matches(&row));
         viewer.filters = Filters::default();
         assert!(viewer.matches(&row));
+    }
+
+    #[test]
+    fn presets_classify_transport_http_pending_blocked_slow_and_json() {
+        for (status, failed, blocked, duration, mime, expected) in [
+            (
+                200,
+                false,
+                false,
+                999,
+                "text/html",
+                vec![Preset::All, Preset::HideErrors],
+            ),
+            (
+                302,
+                false,
+                false,
+                1000,
+                "application/problem+json; charset=utf-8",
+                vec![Preset::All, Preset::HideErrors, Preset::Slow, Preset::Json],
+            ),
+            (404, false, false, 20, "", vec![Preset::All, Preset::Errors]),
+            (503, false, false, 20, "", vec![Preset::All, Preset::Errors]),
+            (0, true, false, 20, "", vec![Preset::All, Preset::Errors]),
+            (
+                0,
+                false,
+                false,
+                0,
+                "",
+                vec![Preset::All, Preset::HideErrors, Preset::Pending],
+            ),
+            (
+                403,
+                false,
+                true,
+                20,
+                "",
+                vec![Preset::All, Preset::Errors, Preset::Blocked],
+            ),
+        ] {
+            let mut event = Row::empty().event;
+            event.is_request_blocked = blocked;
+            {
+                let mut details = event.exchange.lock().unwrap();
+                details.status = (status > 0).then_some(status);
+                details.error = failed.then(|| "TLS failed".into());
+                details.duration_ms = Some(duration);
+                details
+                    .response_headers
+                    .push(("Content-Type".into(), mime.into()));
+            }
+            let row = Row::new(event);
+            for preset in Preset::ALL {
+                assert_eq!(
+                    preset.matches(&row),
+                    expected.contains(&preset),
+                    "{}: status {status}, failed {failed}",
+                    preset.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hide_errors_combines_with_columns_query_and_connect_visibility() {
+        let mut row = sample();
+        row.failed = false;
+        row.status = 200;
+        let mut viewer = Viewer::default();
+        viewer.filters.preset = Preset::HideErrors;
+        viewer.filters.query = "response-marker".into();
+        viewer.filters.columns[2] = "example.test".into();
+        assert!(viewer.matches(&row));
+        row.event.method = "CONNECT".into();
+        assert!(!viewer.matches(&row));
+        viewer.filters.tunnels = true;
+        assert!(viewer.matches(&row));
+        row.failed = true;
+        assert!(!viewer.matches(&row));
+        viewer.filters.preset = Preset::Errors;
+        viewer.filters.tunnels = false;
+        assert!(viewer.matches(&row));
+        viewer.filters.columns[2] = "different.test".into();
+        assert!(!viewer.matches(&row));
+    }
+
+    #[test]
+    fn follow_tracks_only_new_matching_ids_and_resumes_without_new_traffic() {
+        let mut follow = Follow::default();
+        assert!(!follow.update(None, None));
+        assert!(follow.update(Some(1), Some(1)));
+        assert!(
+            !follow.update(Some(1), Some(1)),
+            "body refresh must not jump"
+        );
+        assert!(
+            !follow.update(Some(2), Some(1)),
+            "a new hidden request must not jump"
+        );
+        assert!(
+            !follow.update(Some(2), Some(2)),
+            "completion making an existing row match must not jump"
+        );
+        assert!(follow.update(Some(3), Some(3)));
+        follow.enabled = false;
+        assert!(!follow.update(Some(4), Some(4)));
+        follow.enabled = true;
+        assert!(
+            follow.update(Some(4), Some(4)),
+            "resume scrolls without an arrival"
+        );
+        assert!(!follow.update(Some(4), Some(4)));
+        assert!(
+            !follow.update(Some(4), Some(3)),
+            "editing filters must not jump"
+        );
+        assert!(
+            !follow.update(None, None),
+            "clearing the session must not scroll"
+        );
+        assert!(
+            follow.update(Some(1), Some(1)),
+            "a new capture may restart IDs"
+        );
+    }
+
+    #[test]
+    fn utf8_pages_reassemble_and_full_copy_export_preserve_all_bytes() {
+        let store =
+            privaxy::storage::BodyStore::new(&std::env::temp_dir(), (PAGE * 4) as u64).unwrap();
+        let body = store.body();
+        let source = format!("{}🦀{}日本語", "a".repeat(PAGE - 1), "b".repeat(PAGE - 4));
+        body.push(source.as_bytes());
+        let snapshot = body.snapshot();
+        let ctx = egui::Context::default();
+        let mut palette = None;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            palette = Some(Palette::from_ui(ui))
+        });
+        output.textures_delta.clear();
+        let mut reassembled = String::new();
+        for page in 0..snapshot.len.div_ceil(PAGE as u64) {
+            let view = load_body(
+                &snapshot,
+                LoadKey {
+                    id: 1,
+                    request: false,
+                    length: snapshot.len,
+                    complete: true,
+                    page,
+                    language: Language::Text,
+                    palette: palette.unwrap(),
+                },
+            )
+            .unwrap();
+            let text = &view.text.unwrap().text;
+            assert!(text.len() <= PAGE + 3);
+            assert!(
+                view.hex
+                    .text
+                    .starts_with(&format!("{:08x}", page * PAGE as u64))
+            );
+            reassembled.push_str(text);
+        }
+        assert_eq!(reassembled, source);
+        assert_eq!(
+            snapshot.read_range(0, snapshot.len as usize).unwrap(),
+            source.as_bytes()
+        );
+        let path = std::env::temp_dir().join(format!(
+            "privaxy-traffic-export-{}-{}.bin",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        snapshot.copy_to(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn complete_javascript_above_one_page_formats_whole_and_preserves_capture() {
+        let source: String = (0..3000)
+            .map(|i| format!("const value{i}={{id:{i},text:\"literal;a{{b}}\"}};\n"))
+            .collect();
+        assert!(source.len() > PAGE);
+        let store =
+            privaxy::storage::BodyStore::new(&std::env::temp_dir(), 4 * 1024 * 1024).unwrap();
+        let body = store.body();
+        body.push(source.as_bytes());
+        let snapshot = body.snapshot();
+        let key = LoadKey {
+            id: 2,
+            request: false,
+            length: snapshot.len,
+            complete: true,
+            page: 0,
+            language: Language::JavaScript,
+            palette: palette(),
+        };
+        let started = Instant::now();
+        let document = load_document(&snapshot, key).unwrap();
+        let formatted = document.formatted.code.unwrap();
+        assert!(
+            formatted
+                .text
+                .contains("const value0 = { id: 0, text: \"literal;a{b}\" };")
+        );
+        assert!(
+            formatted
+                .text
+                .contains("const value2999 = { id: 2999, text: \"literal;a{b}\" };")
+        );
+        assert_eq!(formatted.text.matches("literal;a{b}").count(), 3000);
+        assert!(formatted.text.len() > PAGE);
+        assert!(formatted.text.len() <= presentation::FORMAT_OUTPUT_LIMIT);
+        let raw_page = load_body(&snapshot, LoadKey { page: 1, ..key }).unwrap();
+        assert!(raw_page.text.unwrap().text.len() <= PAGE + 3);
+        assert!(
+            load_document(
+                &snapshot,
+                LoadKey {
+                    complete: false,
+                    ..key
+                }
+            )
+            .unwrap()
+            .formatted
+            .code
+            .is_none()
+        );
+        assert_eq!(
+            snapshot.read_range(0, snapshot.len as usize).unwrap(),
+            source.as_bytes()
+        );
+        let path = std::env::temp_dir().join(format!(
+            "privaxy-js-export-{}-{}.js",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        snapshot.copy_to(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
+        std::fs::remove_file(path).unwrap();
+        eprintln!(
+            "whole JS: {} input bytes, {} formatted bytes, {} lines in {:?}",
+            source.len(),
+            formatted.text.len(),
+            formatted.line_count(),
+            started.elapsed()
+        );
     }
 }

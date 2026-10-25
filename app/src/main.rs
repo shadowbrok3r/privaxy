@@ -1,4 +1,5 @@
 use eframe::egui;
+use egui_icon_pack::{phosphor_regular as svg, widgets as icons};
 use egui_theme_kit::{chrome, picker, store::JsonDirStore, title_bar::TitleBar};
 use privaxy::{PrivaxyServer, events::Event, listener::ListenerStatus};
 use std::sync::{Arc, Mutex};
@@ -47,6 +48,7 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, chrome: chrome::Chrome) -> Self {
         egui_theme_kit::init(cc, Default::default());
+        egui_icon_pack::install(&cc.egui_ctx);
         egui_theme_kit::title_bar::windows::client_area::install(cc);
         let store =
             Arc::new(JsonDirStore::open(JsonDirStore::default_dir("privaxy").unwrap()).unwrap());
@@ -132,8 +134,12 @@ impl App {
         }
         *self.relay_status.lock().unwrap() = "Starting relay…".into();
         let (status, connections) = (self.relay_status.clone(), self.connections.clone());
+        let inspection_ca_pem = server.ca_certificate_pem.clone();
         self.relay = Some(self.runtime.spawn(async move {
-            if let Err(e) = identity.serve(status.clone(), connections).await {
+            if let Err(e) = identity
+                .serve(status.clone(), connections, inspection_ca_pem)
+                .await
+            {
                 log::error!("Android relay failed: {e}");
                 *status.lock().unwrap() = e;
             }
@@ -243,26 +249,31 @@ impl eframe::App for App {
             .frameless(self.chrome.frameless)
             .show(ui, |ui, side| match side {
                 egui_theme_kit::title_bar::Side::Left => {
-                    for (tab, label) in [
-                        (Tab::Dashboard, "Dashboard"),
-                        (Tab::Traffic, "Traffic"),
-                        (Tab::Settings, "Settings"),
-                        (Tab::Logs, "Logs"),
+                    for (tab, icon, label) in [
+                        (Tab::Dashboard, svg::GAUGE, "Dashboard"),
+                        (Tab::Traffic, svg::ARROWS_DOWN_UP, "Traffic"),
+                        (Tab::Settings, svg::SLIDERS, "Settings"),
+                        (Tab::Logs, svg::SCROLL, "Logs"),
                     ] {
-                        ui.selectable_value(&mut self.tab, tab, label);
+                        if icons::selectable_button(ui, icon, self.tab == tab, label).clicked() {
+                            self.tab = tab;
+                        }
                     }
                 }
                 egui_theme_kit::title_bar::Side::Right => {
                     let t = egui_theme_kit::Tokens::get(ui.ctx());
-                    if ui
-                        .button(egui::RichText::new(self.connection_label()).color(
+                    if icons::button(
+                        ui,
+                        svg::DEVICE_MOBILE,
+                        egui::RichText::new(self.connection_label()).color(
                             if self.connections.count() > 0 {
                                 t.success
                             } else {
                                 t.text_dim
                             },
-                        ))
-                        .clicked()
+                        ),
+                    )
+                    .clicked()
                     {
                         self.tab = Tab::Dashboard;
                         self.pairing_open = true;
@@ -275,7 +286,9 @@ impl eframe::App for App {
                 let error = self.startup_error.lock().unwrap().clone();
                 if let Some(error) = error {
                     ui.colored_label(egui_theme_kit::Tokens::get(ui.ctx()).error, error);
-                    if server.is_none() && ui.button("Retry startup").clicked() {
+                    if server.is_none()
+                        && icons::button(ui, svg::ARROWS_CLOCKWISE, "Retry startup").clicked()
+                    {
                         self.initialize_backend();
                     }
                 } else if server.is_none() {
@@ -289,7 +302,7 @@ impl eframe::App for App {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(notice);
-                            if ui.small_button("Dismiss").clicked() {
+                            if icons::small_button(ui, svg::X, "Dismiss").clicked() {
                                 self.notice.lock().unwrap().clear();
                             }
                         });

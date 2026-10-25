@@ -21,6 +21,9 @@ serde_json = "1.0"
 
 # Formatting
 num-format = "0.4.0"
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+dprint-plugin-typescript = "0.96.1"
+markup_fmt = "0.27.6"
 
 # Logging
 log = "0.4"
@@ -39,8 +42,9 @@ rfd = "0.17"
 privaxy = { path = "../privaxy" }
 privaxy-diagnostics = { path = "../crates/diagnostics" }
 
-eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland", "persistence"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland", "persistence", "clipboard"] }
 egui-theme-kit = { git = "https://github.com/shadowbrok3r/egui-theme-kit", rev = "09d1e793076357ec5d86df7e1d6771d0306f2e70", default-features = false, features = ["title-bar", "picker", "files"] }
+egui-icon-pack = { git = "https://github.com/shadowbrok3r/egui-theme-kit", rev = "09d1e793076357ec5d86df7e1d6771d0306f2e70", default-features = false, features = ["phosphor-regular"] }
 egui-data-table = { git = "https://github.com/shadowbrok3r/egui-data-table", rev = "1af2ecfacec6b9058b78b967aba2c08303687f8c" }
 egui_json_tree = { git = "https://github.com/shadowbrok3r/egui_json_tree", rev = "84198d09f0e24a65eebbb404199c2a441b3bd958" }
 url = "2"

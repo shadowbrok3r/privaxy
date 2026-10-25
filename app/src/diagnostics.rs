@@ -1,4 +1,5 @@
 use eframe::egui;
+use egui_icon_pack::{phosphor_regular as svg, widgets as icons};
 use egui_theme_kit::Tokens;
 use std::sync::{Arc, Mutex};
 
@@ -28,14 +29,16 @@ impl LogView {
                     .hint_text("Search message or source")
                     .desired_width(230.),
             );
-            if ui.checkbox(&mut self.paused, "Pause view").changed() && self.paused {
+            if icons::checkbox(ui, &mut self.paused, svg::PAUSE, "Pause view").changed()
+                && self.paused
+            {
                 self.frozen = privaxy_diagnostics::entries();
             }
-            if ui.button("Clear view").clicked() {
+            if icons::button(ui, svg::TRASH, "Clear view").clicked() {
                 privaxy_diagnostics::clear_view();
                 self.frozen.clear();
             }
-            if ui.button("Export logs").clicked() {
+            if icons::button(ui, svg::DOWNLOAD_SIMPLE, "Export logs").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .set_file_name("privaxy-desktop.log")
                     .save_file()
@@ -83,7 +86,7 @@ impl LogView {
                 entries.len(),
                 privaxy_diagnostics::dropped_lines()
             ));
-            if ui.button("Copy visible").clicked() {
+            if icons::button(ui, svg::COPY, "Copy visible").clicked() {
                 ui.ctx()
                     .copy_text(entries.iter().map(|e| e.line()).collect());
             }

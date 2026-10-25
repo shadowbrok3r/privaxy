@@ -193,7 +193,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Network overview").size(23.).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Appearance").clicked() {
+                if icons::button(ui, svg::PALETTE, "Appearance").clicked() {
                     self.picker.open = true;
                 }
                 ui.weak("Live session");
@@ -216,31 +216,38 @@ impl App {
                     }
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("127.0.0.1:8100").size(22.).monospace());
-                        if ui.small_button("Copy").clicked() { ui.ctx().copy_text("127.0.0.1:8100".into()); }
+                        if icons::small_button(ui, svg::COPY, "Copy").clicked() { ui.ctx().copy_text("127.0.0.1:8100".into()); }
                     });
                     ui.label("Use this HTTP/HTTPS proxy in your desktop browser or system network settings.");
                     ui.add_space(8.);
                     ui.horizontal_wrapped(|ui| {
-                        if ui.add_enabled(server.is_some() && !state.is_changing(), egui::Button::new(if state.is_running() { "Stop proxy" } else { "Start proxy" })).clicked() {
+                        if ui.add_enabled(server.is_some() && !state.is_changing(), icons::button_widget(ui, if state.is_running() { svg::STOP } else { svg::PLAY }, if state.is_running() { "Stop proxy" } else { "Start proxy" })).clicked() {
                             let server = server.unwrap();
                             if state.is_running() { self.stop_relay(); server.listener.stop(); } else { server.listener.start(); }
                         }
-                        if ui.button("Connect this computer").clicked() { self.setup_open = true; }
-                        if ui.add_enabled(state.is_running() && !self.checking_proxy.load(std::sync::atomic::Ordering::Relaxed), egui::Button::new("Test proxy")).clicked() { self.check_proxy(); }
+                        if icons::button(ui, svg::DESKTOP, "Connect this computer").clicked() { self.setup_open = true; }
+                        if ui.add_enabled(state.is_running() && !self.checking_proxy.load(std::sync::atomic::Ordering::Relaxed), icons::button_widget(ui, svg::PLUGS_CONNECTED, "Test proxy")).clicked() { self.check_proxy(); }
                     });
                     ui.add_space(8.);
                     ui.separator();
                     if let Some(server) = server {
-                        let mut filtering = !*server.blocking_disabled_store.0.read().unwrap();
-                        if ui.checkbox(&mut filtering, "Ad and tracker filtering").changed() {
-                            *server.blocking_disabled_store.0.write().unwrap() = !filtering;
+                        let mut observe_only = !server.blocking_disabled_store.is_enabled();
+                        if icons::checkbox(ui, &mut observe_only, svg::EYE, "Observe only · no blocking").changed() {
+                            server.blocking_disabled_store.set(!observe_only);
+                            let config = {
+                                let mut config = self.config.lock().unwrap();
+                                config.as_mut().map(|cfg| { cfg.observe_only = observe_only; cfg.clone() })
+                            };
+                            if let Some(config) = config { self.save_settings(config, server); }
+                            log::info!("Observe only mode {}", if observe_only { "enabled" } else { "disabled" });
                         }
+                        ui.weak(if observe_only { "Requests are recorded without ad blocking or HTML injection. HTTPS still requires the inspection CA." } else { "Ad, tracker and cosmetic filters are active." });
                     }
                     let counts = self.config.lock().unwrap().as_ref().map(|c| (c.filters.iter().filter(|f| f.enabled).count(), c.filters.len()));
                     if let Some((enabled, total)) = counts { ui.weak(format!("{enabled} of {total} filter lists enabled")); }
                     ui.horizontal_wrapped(|ui| {
                         if ui.link("Manage filters").clicked() { self.tab = Tab::Settings; }
-                        if ui.add_enabled(server.is_some(), egui::Button::new("Export inspection CA").frame(false)).clicked() { self.export_ca(server.unwrap()); }
+                        if ui.add_enabled(server.is_some(), icons::button_widget(ui, svg::CERTIFICATE, "Export inspection CA").frame(false)).clicked() { self.export_ca(server.unwrap()); }
                     });
                 });
                 ui.add_space(12.);
@@ -257,10 +264,10 @@ impl App {
                     ui.label(self.relay_status.lock().unwrap().clone());
                     ui.horizontal_wrapped(|ui| {
                         let label = if self.relay.is_some() { "Stop Android relay" } else { "Start Android relay" };
-                        if ui.add_enabled(server.is_some() && self.identity.is_some(), egui::Button::new(label)).clicked() {
+                        if ui.add_enabled(server.is_some() && self.identity.is_some(), icons::button_widget(ui, if self.relay.is_some() { svg::STOP } else { svg::PLUGS_CONNECTED }, label)).clicked() {
                             if self.relay.is_some() { self.stop_relay(); } else { self.start_relay(server.unwrap()); }
                         }
-                        if ui.button("Pair phone / addresses").clicked() { self.pairing_open = true; }
+                        if icons::button(ui, svg::QR_CODE, "Pair phone / addresses").clicked() { self.pairing_open = true; }
                     });
                     ui.add_space(6.);
                     ui.weak("Saved pairing is separate from a live connection. A phone appears here only after an authenticated heartbeat.");
@@ -317,7 +324,7 @@ impl App {
             ui.horizontal(|ui| {
                 request_header(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Open traffic log").clicked() {
+                    if icons::button(ui, svg::ARROWS_DOWN_UP, "Open traffic log").clicked() {
                         self.tab = Tab::Traffic;
                     }
                 });
@@ -343,7 +350,7 @@ impl App {
         ui.add_space(10.);
         panel(ui, "Appearance", |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Theme presets and templates").clicked() {
+                if icons::button(ui, svg::PALETTE, "Theme presets and templates").clicked() {
                     self.picker.open = true;
                 }
                 chrome::toggle_row(ui, &mut self.chrome, "Custom title bar");
@@ -385,7 +392,7 @@ impl App {
             panel(&mut columns[1],"HTTPS inspection",|ui| {
                 ui.label("Never intercept these hosts (one per line).");
                 ui.add(egui::TextEdit::multiline(&mut self.exclusions).desired_width(f32::INFINITY).desired_rows(4).hint_text("*.example.com"));
-                if ui.add_enabled(server.is_some(),egui::Button::new("Export inspection CA")).clicked(){self.export_ca(server.unwrap());}
+                if ui.add_enabled(server.is_some(),icons::button_widget(ui, svg::CERTIFICATE, "Export inspection CA")).clicked(){self.export_ca(server.unwrap());}
                 ui.weak("Clients must trust this desktop's CA to inspect HTTPS. Excluded hosts pass through encrypted.");
             });
         });
@@ -393,7 +400,7 @@ impl App {
         if ui
             .add_enabled(
                 server.is_some(),
-                egui::Button::new("Save settings and reload filters"),
+                icons::button_widget(ui, svg::FLOPPY_DISK, "Save settings and reload filters"),
             )
             .clicked()
         {
@@ -447,7 +454,7 @@ impl App {
                     .hint_text("Desktop IPv4 address or hostname")
                     .desired_width(300.),
             );
-            if ui.button("Refresh addresses").clicked() {
+            if icons::button(ui, svg::ARROWS_CLOCKWISE, "Refresh addresses").clicked() {
                 self.addresses = network::Addresses::detect();
                 if self.host.trim().is_empty() {
                     self.host = self.addresses.preferred_host();
@@ -464,9 +471,9 @@ impl App {
                 ui.add_space(8.);
                 ui.monospace("Host: 127.0.0.1     Port: 8100");
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("Copy proxy URL").clicked(){ui.ctx().copy_text("http://127.0.0.1:8100".into());}
-                    if ui.button("Copy test command").clicked(){ui.ctx().copy_text("curl --proxy http://127.0.0.1:8100 http://example.com".into());}
-                    if ui.add_enabled(server.is_some(),egui::Button::new("Export inspection CA")).clicked(){self.export_ca(server.unwrap());}
+                    if icons::button(ui, svg::COPY, "Copy proxy URL").clicked(){ui.ctx().copy_text("http://127.0.0.1:8100".into());}
+                    if icons::button(ui, svg::TERMINAL_WINDOW, "Copy test command").clicked(){ui.ctx().copy_text("curl --proxy http://127.0.0.1:8100 http://example.com".into());}
+                    if ui.add_enabled(server.is_some(),icons::button_widget(ui, svg::CERTIFICATE, "Export inspection CA")).clicked(){self.export_ca(server.unwrap());}
                 });
                 ui.add_space(10.);
                 ui.label("Trust the exported inspection CA in the browser or system certificate store to inspect HTTPS. Android pairing is optional; this computer can use the proxy on its own.");
@@ -483,10 +490,12 @@ impl App {
                 self.address_picker(ui);
                 ui.add_space(8.);
                 ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(server.is_some() && self.identity.is_some(),egui::Button::new(if self.relay.is_some(){"Stop Android relay"}else{"Start Android relay"})).clicked(){if self.relay.is_some(){self.stop_relay();}else{self.start_relay(server.unwrap());}}
-                    if let Some(identity)=&self.identity { if let Ok(code)=identity.code(&self.host) { if ui.button("Copy pairing link").clicked(){ui.ctx().copy_text(code);} } }
+                    if ui.add_enabled(server.is_some() && self.identity.is_some(),icons::button_widget(ui, if self.relay.is_some(){svg::STOP}else{svg::PLUGS_CONNECTED}, if self.relay.is_some(){"Stop Android relay"}else{"Start Android relay"})).clicked(){if self.relay.is_some(){self.stop_relay();}else{self.start_relay(server.unwrap());}}
+                    if let Some(identity)=&self.identity { if let Ok(code)=identity.code(&self.host) { if icons::button(ui, svg::LINK, "Copy pairing link").clicked(){ui.ctx().copy_text(code);} } }
                 });
                 ui.label("Scan to open Privaxy on Android, then tap Pair desktop. For an existing pairing, change Desktop IP or hostname and tap Save address on the phone.");
+                icons::label(ui, svg::CERTIFICATE, "The inspection CA is sent automatically over the paired connection.");
+                ui.weak("On Android, use Install desktop CA in Pairing. Android requires approval in Settings once per CA.");
                 if let Some(identity)=&self.identity {
                     match identity.code(&self.host) {
                         Ok(code)=>{ if let Ok(qr)=qrcode::QrCode::new(code.as_bytes()) {
@@ -505,7 +514,7 @@ impl App {
                     ui.label("If this desktop uses a Tailscale exit node, allow LAN access in Tailscale so it can reply to the phone. A saved pairing does not prove network reachability.");
                     ui.label("Android supports one VPN at a time: use LAN for Capture all traffic. With the Tailscale Android VPN, keep capture off and use proxy-only mode with supported apps.");
                 });
-                if ui.button("Revoke all pairings…").clicked(){self.revoke_confirm=true;}
+                if icons::button(ui, svg::SHIELD_SLASH, "Revoke all pairings…").clicked(){self.revoke_confirm=true;}
             });
             self.pairing_open = open;
         }
@@ -513,7 +522,7 @@ impl App {
             let modal=egui::Modal::new(egui::Id::unique("revoke_pairings")).show(ctx,|ui| {
                 ui.set_width(360.); ui.heading("Revoke all desktop pairings?");
                 ui.label("This disconnects every phone and replaces the pairing credentials. Each phone will need to scan a new code.");
-                ui.horizontal(|ui|(ui.button("Cancel").clicked(),ui.button("Revoke pairings").clicked())).inner
+                ui.horizontal(|ui|(icons::button(ui, svg::X, "Cancel").clicked(),icons::button(ui, svg::TRASH, "Revoke pairings").clicked())).inner
             });
             if modal.inner.0 || modal.should_close() {
                 self.revoke_confirm = false;

@@ -116,6 +116,9 @@ pub struct Ca {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Configuration {
+    /// Inspect and record without adblock decisions or HTML rewriting.
+    #[serde(default)]
+    pub observe_only: bool,
     pub exclusions: BTreeSet<String>,
     pub custom_filters: Vec<String>,
     ca: Ca,
@@ -296,6 +299,7 @@ impl Configuration {
             .to_string();
 
         Ok(Configuration {
+            observe_only: false,
             filters: default_filters
                 .into_iter()
                 .map(|filter| filter.into())
@@ -398,6 +402,8 @@ impl ConfigurationUpdater {
     pub(crate) fn start(mut self) {
         tokio::spawn(async move {
             if let Some(configuration) = self.rx.recv().await {
+                self.adblock_requester
+                    .set_observe_only(configuration.observe_only);
                 self.filters_updater_abort_handle.abort();
 
                 let filters = get_filters_content(&configuration, &self.http_client).await;
@@ -469,6 +475,7 @@ mod tests {
 
     fn configuration() -> Configuration {
         Configuration {
+            observe_only: false,
             exclusions: BTreeSet::from(["trusted.example".into()]),
             custom_filters: vec!["||ads.example^".into()],
             ca: Ca {

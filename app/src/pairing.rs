@@ -11,6 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8101);
 pub const STATUS_PROTOCOL: &[u8] = b"privaxy-status-v1";
+pub const STATUS_CA_PROTOCOL: &[u8] = b"privaxy-status-v2";
+const MAX_CA_BYTES: usize = 16 * 1024;
 
 #[derive(Default)]
 pub struct Connections {
@@ -107,6 +109,7 @@ impl Identity {
         self,
         status: Arc<Mutex<String>>,
         connections: Arc<Connections>,
+        inspection_ca_pem: String,
     ) -> Result<(), String> {
         let listener = tokio::net::TcpListener::bind(LISTEN_ADDRESS)
             .await
@@ -114,15 +117,34 @@ impl Identity {
         log::info!("Android relay listening on {LISTEN_ADDRESS}");
         *status.lock().unwrap() =
             format!("Listening on {LISTEN_ADDRESS} (encrypted, paired clients only)");
-        self.serve_on(listener, "127.0.0.1:8100".parse().unwrap(), connections)
-            .await
+        self.serve_on(
+            listener,
+            "127.0.0.1:8100".parse().unwrap(),
+            connections,
+            inspection_ca_pem,
+        )
+        .await
     }
     async fn serve_on(
         self,
         listener: tokio::net::TcpListener,
         upstream: std::net::SocketAddr,
         connections: Arc<Connections>,
+        inspection_ca_pem: String,
     ) -> Result<(), String> {
+        // Only the active proxy's public inspection certificate belongs on the wire.
+        if inspection_ca_pem.len() > MAX_CA_BYTES
+            || !inspection_ca_pem
+                .trim()
+                .starts_with("-----BEGIN CERTIFICATE-----")
+            || !inspection_ca_pem
+                .trim()
+                .ends_with("-----END CERTIFICATE-----")
+            || inspection_ca_pem.matches("-----BEGIN").count() != 1
+        {
+            return Err("The proxy inspection CA is not a single public certificate".into());
+        }
+        let inspection_ca_pem = Arc::new(inspection_ca_pem);
         if self.token.len() != 64 || !self.token.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(
                 "Stored pairing credentials are invalid; revoke pairings to regenerate them."
@@ -136,7 +158,7 @@ impl Identity {
                 rustls_pki_types::PrivatePkcs8KeyDer::from(self.key).into(),
             )
             .map_err(|e| e.to_string())?;
-        config.alpn_protocols = vec![STATUS_PROTOCOL.to_vec()];
+        config.alpn_protocols = vec![STATUS_CA_PROTOCOL.to_vec(), STATUS_PROTOCOL.to_vec()];
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
         let limit = Arc::new(tokio::sync::Semaphore::new(128));
         let mut tasks = tokio::task::JoinSet::new();
@@ -151,6 +173,7 @@ impl Identity {
             let acceptor = acceptor.clone();
             let token = self.token.clone();
             let connections = connections.clone();
+            let inspection_ca_pem = inspection_ca_pem.clone();
             tasks.spawn(async move {
                 let _permit = permit;
                 let handshake = async {
@@ -170,7 +193,8 @@ impl Identity {
                     if difference != 0 {
                         return Err(std::io::Error::other("Pairing rejected"));
                     }
-                    let status_only = tls.get_ref().1.alpn_protocol() == Some(STATUS_PROTOCOL);
+                    let status_only = matches!(tls.get_ref().1.alpn_protocol(),
+                        Some(protocol) if protocol == STATUS_PROTOCOL || protocol == STATUS_CA_PROTOCOL);
                     let local = if status_only {
                         None
                     } else {
@@ -213,10 +237,15 @@ impl Identity {
                         let mut connected = None;
                         loop {
                             let heartbeat = async {
-                                if tls.read_u8().await? != b'P' {
-                                    return Err(std::io::Error::other("Invalid heartbeat"));
+                                match tls.read_u8().await? {
+                                    b'P' => tls.write_all(b"P").await?,
+                                    b'C' if tls.get_ref().1.alpn_protocol() == Some(STATUS_CA_PROTOCOL) => {
+                                        tls.write_u32(inspection_ca_pem.len() as u32).await?;
+                                        tls.write_all(inspection_ca_pem.as_bytes()).await?;
+                                        log::debug!("Inspection CA sent to paired phone peer={peer} bytes={}", inspection_ca_pem.len());
+                                    }
+                                    _ => return Err(std::io::Error::other("Invalid status command")),
                                 }
-                                tls.write_all(b"P").await?;
                                 tls.flush().await
                             };
                             match tokio::time::timeout(
@@ -253,6 +282,19 @@ impl Identity {
 mod tests {
     use super::*;
 
+    fn inspection_ca() -> String {
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let mut name = rcgen::DistinguishedName::new();
+        name.push(rcgen::DnType::CommonName, "Privaxy test inspection CA");
+        params.distinguished_name = name;
+        params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .pem()
+    }
+
     fn identity() -> Identity {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let rcgen::CertifiedKey { cert, signing_key } =
@@ -287,6 +329,7 @@ mod tests {
             listener,
             "127.0.0.1:0".parse().unwrap(),
             connections.clone(),
+            inspection_ca(),
         ));
         let connect = || async {
             connector
@@ -327,6 +370,64 @@ mod tests {
         let _ = server.await;
     }
 
+    #[tokio::test]
+    async fn inspection_ca_requires_authentication_and_preserves_heartbeats() {
+        let identity = identity();
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls_pki_types::CertificateDer::from(
+                identity.cert.clone(),
+            ))
+            .unwrap();
+        let mut config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![STATUS_CA_PROTOCOL.to_vec(), STATUS_PROTOCOL.to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let ca = inspection_ca();
+        let expected = ca.clone();
+        let server = tokio::spawn(identity.serve_on(
+            listener,
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::default(),
+            ca,
+        ));
+        let connect = || async {
+            connector
+                .connect(
+                    rustls_pki_types::ServerName::try_from("privaxy-desktop").unwrap(),
+                    tokio::net::TcpStream::connect(address).await.unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        let mut invalid = connect().await;
+        invalid.write_all(&[b'b'; 64]).await.unwrap();
+        let _ = invalid.write_all(b"C").await;
+        assert!(invalid.read_u8().await.is_err());
+        let mut phone = connect().await;
+        assert_eq!(phone.get_ref().1.alpn_protocol(), Some(STATUS_CA_PROTOCOL));
+        phone.write_all(&[b'a'; 64]).await.unwrap();
+        let mut ack = [0; 2];
+        phone.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"OK");
+        for _ in 0..2 {
+            phone.write_all(b"C").await.unwrap();
+            let size = phone.read_u32().await.unwrap() as usize;
+            assert!(size < MAX_CA_BYTES);
+            let mut received = vec![0; size];
+            phone.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, expected.as_bytes());
+            assert!(!String::from_utf8(received).unwrap().contains("PRIVATE KEY"));
+            phone.write_all(b"P").await.unwrap();
+            assert_eq!(phone.read_u8().await.unwrap(), b'P');
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
     /// Real desktop protocol for emulator validation; never touches the user's identity/config.
     #[tokio::test]
     #[ignore = "requires PRIVAXY_DEVICE_FIXTURE directory and port 8101"]
@@ -340,11 +441,18 @@ mod tests {
             identity.code("10.0.2.2").unwrap(),
         )
         .unwrap();
+        let mut active_ca = inspection_ca();
+        std::fs::write(root.join("inspection-ca.crt"), &active_ca).unwrap();
         let connections = Arc::new(Connections::default());
         let counts = connections.clone();
+        let counts_root = root.clone();
         tokio::spawn(async move {
             loop {
-                std::fs::write(root.join("connections.txt"), counts.count().to_string()).unwrap();
+                std::fs::write(
+                    counts_root.join("connections.txt"),
+                    counts.count().to_string(),
+                )
+                .unwrap();
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         });
@@ -360,14 +468,28 @@ mod tests {
                 });
             }
         });
-        identity
-            .serve_on(
+        loop {
+            let mut relay = tokio::spawn(identity.clone().serve_on(
                 tokio::net::TcpListener::bind(LISTEN_ADDRESS).await.unwrap(),
                 upstream,
-                connections,
-            )
-            .await
-            .unwrap();
+                connections.clone(),
+                active_ca,
+            ));
+            let rotate = async {
+                while !root.join("rotate-ca").exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            };
+            tokio::select! {
+                result = &mut relay => panic!("Device relay ended: {result:?}"),
+                _ = rotate => {}
+            }
+            std::fs::remove_file(root.join("rotate-ca")).unwrap();
+            relay.abort();
+            let _ = relay.await;
+            active_ca = inspection_ca();
+            std::fs::write(root.join("inspection-ca.crt"), &active_ca).unwrap();
+        }
     }
 
     #[test]
@@ -431,8 +553,12 @@ mod tests {
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay_address = listener.local_addr().unwrap();
-        let server =
-            tokio::spawn(identity.serve_on(listener, address, Arc::new(Connections::default())));
+        let server = tokio::spawn(identity.serve_on(
+            listener,
+            address,
+            Arc::new(Connections::default()),
+            inspection_ca(),
+        ));
         let connect = || async {
             connector
                 .connect(

@@ -98,14 +98,15 @@ pub async fn try_start_privaxy() -> Result<PrivaxyServer, String> {
     let (broadcast_tx, _broadcast_rx) = broadcast::channel(32);
     let broadcast_tx_clone = broadcast_tx.clone();
 
-    let blocking_disabled_store =
-        blocker::BlockingDisabledStore(Arc::new(std::sync::RwLock::new(false)));
+    let blocking_disabled_store = blocker::BlockingDisabledStore(Arc::new(std::sync::RwLock::new(
+        configuration.observe_only,
+    )));
     let blocking_disabled_store_clone = blocking_disabled_store.clone();
 
     let (crossbeam_sender, crossbeam_receiver) = crossbeam_channel::unbounded();
     let blocker_sender = crossbeam_sender.clone();
 
-    let blocker_requester = AdblockRequester::new(blocker_sender);
+    let blocker_requester = AdblockRequester::new(blocker_sender, blocking_disabled_store.clone());
 
     let configuration_updater = configuration::ConfigurationUpdater::new(
         configuration.clone(),

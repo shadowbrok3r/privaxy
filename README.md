@@ -28,7 +28,8 @@ and the theme preset picker under Settings. The previous Dioxus UI remains avail
 The title bar has **Dashboard**, **Traffic**, **Settings**, and **Logs**.
 Dashboard combines proxy controls, filtering, Android connection status, a live
 request chart, top destinations, and recent requests. Settings contains appearance,
-filter lists, custom rules, and HTTPS exclusions.
+filter lists, custom rules, and HTTPS exclusions. Navigation and actions use the shared
+Git-pinned SVG icon pack, tinted by the selected theme.
 
 Traffic uses the Git-pinned egui-data-table and egui_json_tree forks. Click a request
 to open its docked inspector; drag the divider to resize it. Right-click a column
@@ -36,15 +37,25 @@ header to hide/show columns, drag headers to reorder, or drag borders to resize.
 Search covers all columns, request/response headers and trailers, capture errors,
 notes, and complete retained body bytes. Body searches run in the background, including
 content beyond the inspector's current page; encrypted or uncaptured content cannot match.
-Use **Column filters** to combine text filters for any column, including hidden columns;
-**Reset filters** clears the search and column filters. Sort the table, filter
-failures/blocked requests, or include CONNECT handshakes (hidden initially).
+Use **Column filters** to combine text filters for any column, including hidden columns.
+The popup stays open while typing and closes with **Done**, Escape, or an outside click.
+Presets include **All requests**, **Hide errors**, **Errors**, **Blocked**, **Slow (≥ 1 s)**,
+**Pending**, and **JSON responses**; they combine with text and column filters.
+**Reset filters** clears all filters. CONNECT handshakes are hidden initially.
+**Follow new requests** keeps matching arrivals in chronological order and scrolls to them
+without changing the selected inspector. Turn it off to browse and sort manually; turning
+it off restores the manual table's sort and column layout.
 Scrollbars remain visible with contrasting handles, including on wide tables.
 Request/response views include headers, duplicate
 header values, bodies, timing, client, status and capture errors. JSON has a
-collapsible searchable tree and formatted copy; text/hex bodies use 64 KiB pages.
-Complete JSON up to 8 MiB uses the tree; larger bodies remain available through
-paging and full body export. Capture retains up to 5,000 requests and 512 MiB of
+collapsible searchable tree and formatted copy. HTML, JavaScript, TypeScript, CSS, XML,
+and JSON source use syntax highlighting; hexadecimal views color offsets, byte classes,
+and the ASCII column. **Pretty** uses parser-based HTML/XML and JavaScript/TypeScript
+formatters on complete bodies up to 2 MiB, with an 8 MiB output limit. Formatting and
+highlighting run off the UI thread, with only visible lines laid out. Unsupported or
+incomplete content falls back to source without changing the captured bytes.
+Raw text/hex bodies use 64 KiB pages. Complete JSON up to 8 MiB uses the tree; larger
+bodies remain available through paging and full body export. Capture retains up to 5,000 requests and 512 MiB of
 body data per session; reaching a limit is explicit and does not stop forwarding.
 Clear session releases the capture and begins a fresh one. TLS passthrough and
 upgraded protocol frames are labelled as not decoded.
@@ -67,6 +78,12 @@ closes the listener, active HTTP/CONNECT streams, and Android relay; **Start pro
 reopens it without clearing statistics or reinitializing filters. Bind errors
 appear on Dashboard and can be retried after freeing the port. Android is optional.
 
+Enable **Observe only · no blocking** on Dashboard to keep inspection and capture while
+disabling ad/tracker decisions and HTML rewriting. The preference survives restarts and
+also applies to traffic from paired phones. Clients must still trust the desktop CA;
+excluded hosts pass through encrypted with metadata only. This option does not configure
+Linux transparent routing or change firewall rules.
+
 1. Open **Pair phone / addresses** on Dashboard (or click Android status in the
    title bar). The computer's Tailscale IPv4 address is selected
    automatically when available, otherwise a LAN address. Every active IPv4 address
@@ -83,6 +100,11 @@ appear on Dashboard and can be retried after freeing the port. Android is option
    link/code into **Paste pairing code**. Existing `privaxy-pair-v1:` codes still work.
    After pairing, edit **Desktop IP or hostname** and **Relay port** on Android,
    then **Save address** to switch networks without replacing the pinned certificate.
+   The authenticated relay automatically sends its public inspection CA to updated Android
+   clients. Use **Pairing → Install desktop CA** on the phone, then approve the downloaded
+   certificate in Android Security settings. Installation is checked separately from pairing
+   and from Android's local CA. The CA is cached and refreshed on reconnect and periodically;
+   a changed CA prompts installation again. Neither CA private key leaves its device.
 3. Enable **Route captured TCP traffic through desktop**. On LAN, enable
    **Capture all traffic** on Dashboard. With the Tailscale Android VPN, leave
    capture off and point proxy-aware apps at `127.0.0.1:8100`. Keep Privaxy included

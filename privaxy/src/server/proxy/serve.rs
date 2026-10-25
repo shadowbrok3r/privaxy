@@ -180,7 +180,7 @@ pub(crate) async fn serve(
         // including SSE and large/binary downloads, is forwarded and captured incrementally.
         const MAX_REWRITE: usize = 1024 * 1024;
         let mut prefix = Vec::new();
-        if html {
+        if html && adblock_requester.filtering_enabled() {
             loop {
                 match response.chunk().await {
                     Ok(Some(chunk)) => {
@@ -309,7 +309,13 @@ async fn rewrite_html(
             )
             .await;
 
-        let mut response_has_been_modified = false;
+        if blocker_result.hidden_selectors.is_empty()
+            && blocker_result.style_selectors.is_empty()
+            && blocker_result.injected_script.is_none()
+        {
+            return body;
+        }
+        let mut response_has_been_modified = !blocker_result.hidden_selectors.is_empty();
 
         let mut to_append = format!(
             r#"
@@ -518,6 +524,48 @@ mod inspection_tests {
     use tokio::{net::TcpListener, sync::oneshot};
 
     #[tokio::test]
+    async fn observe_only_bypasses_filter_decisions_and_empty_cosmetics_preserve_exact_body() {
+        let (sender, receiver) = crossbeam_channel::unbounded::<BlockerRequest>();
+        let filtering =
+            crate::blocker::BlockingDisabledStore(Arc::new(std::sync::RwLock::new(true)));
+        let requester = AdblockRequester::new(sender, filtering.clone());
+        // No worker is running: Observe only must bypass filter decisions entirely.
+        let (blocked, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            requester.is_network_url_blocked(
+                "https://ads.example/".into(),
+                "https://example.com/".into(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(!blocked);
+        assert!(receiver.try_recv().is_err());
+        filtering.set(true);
+        let worker = std::thread::spawn(move || {
+            let request = receiver.recv().unwrap();
+            request
+                .respond_to
+                .send(Decision::Cosmetic(crate::blocker::CosmeticBlockerResult {
+                    hidden_selectors: Vec::new(),
+                    style_selectors: std::collections::HashMap::new(),
+                    injected_script: None,
+                }))
+                .unwrap();
+        });
+        let html = Bytes::from_static(b"<!DOCTYPE html><BODY><DIV class='ad' > keep </DIV></BODY>");
+        let output = rewrite_html(
+            "https://example.com".into(),
+            html.clone(),
+            requester,
+            Statistics::new(),
+        )
+        .await;
+        assert_eq!(output, html);
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn captures_exact_upload_download_and_streams_before_completion() {
         let (sender, receiver) = crossbeam_channel::unbounded::<BlockerRequest>();
         let blocker = std::thread::spawn(move || {
@@ -527,7 +575,9 @@ mod inspection_tests {
                     .send(Decision::Network(BlockerResult::default()));
             }
         });
-        let requester = AdblockRequester::new(sender);
+        let filtering =
+            crate::blocker::BlockingDisabledStore(Arc::new(std::sync::RwLock::new(false)));
+        let requester = AdblockRequester::new(sender, filtering.clone());
         let capture = CaptureStore::new(&std::env::temp_dir().join("privaxy-http-test")).unwrap();
         let (release, pending) = oneshot::channel::<()>();
         let pending = Arc::new(Mutex::new(Some(pending)));
@@ -545,6 +595,7 @@ mod inspection_tests {
                             service_fn(move |request: Request<Incoming>| {
                                 let pending = pending.clone();
                                 async move {
+                                    let html = request.uri().path() == "/html";
                                     let response = if request.uri().path() == "/stream" {
                                         let pending = pending.lock().unwrap().take().unwrap();
                                         let stream = futures_util::stream::once(async {
@@ -568,7 +619,14 @@ mod inspection_tests {
                                             request.into_body().collect().await.unwrap().to_bytes();
                                         Response::builder()
                                             .status(201)
-                                            .header("content-type", "application/octet-stream")
+                                            .header(
+                                                "content-type",
+                                                if html {
+                                                    "text/html"
+                                                } else {
+                                                    "application/octet-stream"
+                                                },
+                                            )
                                             .header("x-duplicate", "one")
                                             .header("x-duplicate", "two")
                                             .header("content-length", data.len())
@@ -675,6 +733,36 @@ mod inspection_tests {
         assert_eq!(
             details.response_body.snapshot().read_range(0, 64).unwrap(),
             b"first\nlast\n"
+        );
+        drop(details);
+        // Observe only must neither buffer/rewrite HTML nor stop capture.
+        filtering.set(false);
+        let html = "<!DOCTYPE html>\n<body><DIV class='ad' >  exact bytes </DIV></body>";
+        let response = client
+            .post(format!("http://{origin_address}/html"))
+            .body(html)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_LENGTH],
+            html.len().to_string()
+        );
+        assert_eq!(response.text().await.unwrap(), html);
+        let events = capture.events();
+        let html_event = events
+            .iter()
+            .find(|event| event.url.ends_with("/html"))
+            .unwrap();
+        let details = html_event.exchange.lock().unwrap();
+        assert_eq!(
+            details
+                .response_body
+                .snapshot()
+                .read_range(0, html.len())
+                .unwrap(),
+            html.as_bytes()
         );
         drop(details);
         proxy.abort();

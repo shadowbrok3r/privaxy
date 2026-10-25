@@ -231,13 +231,25 @@ impl Blocker {
 #[derive(Debug, Clone)]
 pub(crate) struct AdblockRequester {
     adblock_request_channel: AdblockRequestChannel,
+    blocking_disabled: BlockingDisabledStore,
 }
 
 impl AdblockRequester {
-    pub(crate) fn new(adblock_request_channel: AdblockRequestChannel) -> Self {
+    pub(crate) fn new(
+        adblock_request_channel: AdblockRequestChannel,
+        blocking_disabled: BlockingDisabledStore,
+    ) -> Self {
         Self {
             adblock_request_channel,
+            blocking_disabled,
         }
+    }
+
+    pub(crate) fn filtering_enabled(&self) -> bool {
+        self.blocking_disabled.is_enabled()
+    }
+    pub(crate) fn set_observe_only(&self, observe_only: bool) {
+        self.blocking_disabled.set(!observe_only);
     }
 
     pub(crate) async fn replace_engine(&self, filters: Vec<String>) {
@@ -280,6 +292,9 @@ impl AdblockRequester {
         network_url: String,
         referer: String,
     ) -> (bool, adblock::blocker::BlockerResult) {
+        if !self.filtering_enabled() {
+            return (false, adblock::blocker::BlockerResult::default());
+        }
         let (sender, receiver) = oneshot::channel();
 
         self.adblock_request_channel
