@@ -33,8 +33,14 @@ filter lists, custom rules, and HTTPS exclusions.
 Traffic uses the Git-pinned egui-data-table and egui_json_tree forks. Click a request
 to open its docked inspector; drag the divider to resize it. Right-click a column
 header to hide/show columns, drag headers to reorder, or drag borders to resize.
-Search and sort the table, filter failures/blocked requests, or include CONNECT
-handshakes (hidden initially). Request/response views include headers, duplicate
+Search covers all columns, request/response headers and trailers, capture errors,
+notes, and complete retained body bytes. Body searches run in the background, including
+content beyond the inspector's current page; encrypted or uncaptured content cannot match.
+Use **Column filters** to combine text filters for any column, including hidden columns;
+**Reset filters** clears the search and column filters. Sort the table, filter
+failures/blocked requests, or include CONNECT handshakes (hidden initially).
+Scrollbars remain visible with contrasting handles, including on wide tables.
+Request/response views include headers, duplicate
 header values, bodies, timing, client, status and capture errors. JSON has a
 collapsible searchable tree and formatted copy; text/hex bodies use 64 KiB pages.
 Complete JSON up to 8 MiB uses the tree; larger bodies remain available through

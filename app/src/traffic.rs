@@ -40,6 +40,7 @@ struct Row {
     sent: u64,
     failed: bool,
     search: String,
+    bodies: [BodySnapshot; 2],
 }
 impl Row {
     fn new(event: Event) -> Self {
@@ -100,7 +101,25 @@ impl Row {
             format!("{:?}", details.request_version),
             event.id.to_string(),
         ];
-        let search = format!("{} {}", event.url, values.join(" ")).to_lowercase();
+        let mut search = format!("{} {}", event.url, values.join(" "));
+        for (name, value) in details
+            .request_headers
+            .iter()
+            .chain(&details.response_headers)
+            .chain(&details.request_trailers)
+            .chain(&details.response_trailers)
+        {
+            search.push_str(&format!("\n{name}: {value}"));
+        }
+        for note in [&details.error, &details.note].into_iter().flatten() {
+            search.push('\n');
+            search.push_str(note);
+        }
+        let search = search.to_lowercase();
+        let bodies = [
+            details.request_body.snapshot(),
+            details.response_body.snapshot(),
+        ];
         let failed = details.error.is_some();
         drop(details);
         Self {
@@ -112,6 +131,7 @@ impl Row {
             sent,
             failed,
             search,
+            bodies,
         }
     }
     fn empty() -> Self {
@@ -126,12 +146,36 @@ impl Row {
     }
 }
 
-#[derive(Default)]
-struct Viewer {
+#[derive(Default, Clone, PartialEq, Eq, Hash)]
+struct Filters {
     query: String,
     filter: u8,
     tunnels: bool,
+    columns: [String; 12],
+}
+#[derive(Default)]
+struct Viewer {
+    filters: Filters,
+    body_search: crate::traffic_search::BodySearch,
     selected: Option<Event>,
+}
+impl Viewer {
+    fn matches(&self, row: &Row) -> bool {
+        let f = &self.filters;
+        (f.tunnels || row.event.method != "CONNECT" || row.failed)
+            && (f.query.trim().is_empty()
+                || row.search.contains(&f.query.trim().to_lowercase())
+                || self.body_search.matches(row.event.id, &row.bodies))
+            && f.columns.iter().zip(&row.values).all(|(query, value)| {
+                query.trim().is_empty()
+                    || value.to_lowercase().contains(&query.trim().to_lowercase())
+            })
+            && match f.filter {
+                1 => row.failed || row.status >= 400,
+                2 => row.event.is_request_blocked,
+                _ => true,
+            }
+    }
 }
 struct Clipboard;
 impl RowCodec<Row> for Clipboard {
@@ -212,16 +256,10 @@ impl RowViewer<Row> for Viewer {
         }
     }
     fn row_filter_hash(&mut self) -> &impl std::hash::Hash {
-        &self.query
+        &self.filters
     }
     fn filter_row(&mut self, row: &Row) -> bool {
-        (self.tunnels || row.event.method != "CONNECT" || row.failed)
-            && (self.query.is_empty() || row.search.contains(&self.query.to_lowercase()))
-            && match self.filter {
-                1 => row.failed || row.status >= 400,
-                2 => row.event.is_request_blocked,
-                _ => true,
-            }
+        self.matches(row)
     }
     fn is_editable_cell(&mut self, _: usize, _: usize, _: &Row) -> bool {
         false
@@ -339,7 +377,7 @@ impl Traffic {
         self.viewer.selected = Some(event);
     }
     pub fn search(&mut self, query: String) {
-        self.viewer.query = query;
+        self.viewer.filters.query = query;
     }
     pub fn show(
         &mut self,
@@ -348,17 +386,36 @@ impl Traffic {
         events: &[Event],
         notice: Arc<Mutex<String>>,
     ) {
+        let old_filters = self.viewer.filters.clone();
         let mut cleared = false;
         ui.horizontal_wrapped(|ui| {
             ui.add(
-                egui::TextEdit::singleline(&mut self.viewer.query)
-                    .hint_text("Search host, URL, method, status…")
+                egui::TextEdit::singleline(&mut self.viewer.filters.query)
+                    .hint_text("Search all traffic…")
+                    .char_limit(1024)
                     .desired_width(240.),
-            );
+            ).on_hover_text("Search all columns, URLs, request/response headers, trailers, errors and complete captured bodies. Case-insensitive text; encrypted or uncaptured payloads cannot be searched.");
             for (index, label) in [(0, "All"), (1, "Errors"), (2, "Blocked")] {
-                ui.selectable_value(&mut self.viewer.filter, index, label);
+                ui.selectable_value(&mut self.viewer.filters.filter, index, label);
             }
-            ui.checkbox(&mut self.viewer.tunnels, "CONNECT");
+            ui.checkbox(&mut self.viewer.filters.tunnels, "CONNECT");
+            let active = self.viewer.filters.columns.iter().filter(|q| !q.trim().is_empty()).count();
+            ui.menu_button(format!("Column filters ({active})"), |ui| {
+                ui.label("Match every filled field, including hidden columns.");
+                egui::Grid::new("traffic_column_filters").num_columns(2).show(ui, |ui| {
+                    for (column, name) in COLUMNS.iter().enumerate() {
+                        ui.label(*name);
+                        ui.add(egui::TextEdit::singleline(&mut self.viewer.filters.columns[column])
+                            .hint_text(format!("Filter {name}"))
+                            .char_limit(256)
+                            .desired_width(210.));
+                        ui.end_row();
+                    }
+                });
+            });
+            if ui.button("Reset filters").clicked() {
+                self.viewer.filters = Filters::default();
+            }
             if ui.button("Clear session").clicked() {
                 if let Some(server) = server {
                     if let Err(error) = server.capture.clear() {
@@ -369,32 +426,12 @@ impl Traffic {
                 self.table.replace(vec![]);
                 self.viewer.selected = None;
                 self.body = None;
+                self.viewer.body_search = Default::default();
             }
         });
         if cleared {
             return;
         }
-        let filtered = self
-            .table
-            .iter()
-            .filter(|row| {
-                (self.viewer.tunnels || row.event.method != "CONNECT" || row.failed)
-                    && row.search.contains(&self.viewer.query.to_lowercase())
-                    && match self.viewer.filter {
-                        1 => row.failed || row.status >= 400,
-                        2 => row.event.is_request_blocked,
-                        _ => true,
-                    }
-            })
-            .count();
-        ui.horizontal_wrapped(|ui| {
-            ui.weak(format!("{filtered} sessions · {} captured",bytes(server.map_or(0,|s|s.capture.used()))));
-            ui.weak("Right-click headers to choose columns. Drag headers or borders to reorder or resize.");
-        });
-        if let Some(problem) = server.and_then(|s| s.capture.problem()) {
-            ui.colored_label(Tokens::get(ui.ctx()).warn, problem);
-        }
-        ui.add_space(6.);
         if self.refreshed.elapsed() >= Duration::from_millis(350)
             || self.table.len() != events.len()
         {
@@ -402,22 +439,38 @@ impl Traffic {
                 .replace(events.iter().cloned().map(Row::new).collect());
             self.refreshed = Instant::now();
         }
-        // Revalidate when either filter changes, even when no new network traffic arrives.
-        let filter_key = (
-            self.viewer.query.clone(),
-            self.viewer.filter,
-            self.viewer.tunnels,
+        let search_changed = self.viewer.body_search.update(
+            &self.viewer.filters.query.trim().to_lowercase(),
+            self.table
+                .iter()
+                .map(|row| (row.event.id, row.bodies.clone())),
+            ui.ctx(),
         );
-        let key = ui.scope_id().with("filter");
-        let changed = ui.ctx().data_mut(|d| {
-            let old = d.get_temp::<(String, u8, bool)>(key);
-            d.insert_temp(key, filter_key.clone());
-            old.as_ref() != Some(&filter_key)
-        });
-        if changed {
+        if search_changed || old_filters != self.viewer.filters {
             let rows = self.table.take();
             self.table.replace(rows);
         }
+        let filtered = self
+            .table
+            .iter()
+            .filter(|row| self.viewer.matches(row))
+            .count();
+        ui.horizontal_wrapped(|ui| {
+            ui.weak(format!("{filtered} / {} sessions · {} captured", events.len(), bytes(server.map_or(0,|s|s.capture.used()))));
+            if self.viewer.body_search.searching() {
+                ui.spinner();
+                ui.weak("Searching captured bodies…");
+            }
+            ui.weak("Right-click headers to choose columns. Drag headers or borders to reorder or resize.");
+        });
+        let errors = self.viewer.body_search.errors();
+        if errors > 0 {
+            ui.colored_label(Tokens::get(ui.ctx()).warn, format!("{errors} sessions have unreadable body files; their metadata is still searchable."));
+        }
+        if let Some(problem) = server.and_then(|s| s.capture.problem()) {
+            ui.colored_label(Tokens::get(ui.ctx()).warn, problem);
+        }
+        ui.add_space(6.);
         let full = ui.available_rect_before_wrap();
         let selected = self.viewer.selected.clone();
         let table_rect = if selected.is_some() {
@@ -467,7 +520,10 @@ impl Traffic {
         }
         Renderer::new(&mut self.table, &mut self.viewer)
             .with_table_row_height(ui.spacing().interact_size.y.max(24.))
-            .with_style_modify(|style| style.auto_shrink = egui::Vec2b::FALSE)
+            .with_style_modify(|style| {
+                style.auto_shrink = egui::Vec2b::FALSE;
+                style.scroll_bar_visibility = egui::scroll_area::ScrollBarVisibility::AlwaysVisible;
+            })
             .show(&mut table_ui);
         ui.allocate_rect(full, egui::Sense::hover());
     }
@@ -511,6 +567,7 @@ impl Traffic {
         }
         if self.side == Side::Overview {
             egui::ScrollArea::vertical()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .id_salt("overview")
                 .show(ui, |ui| {
                     egui::Grid::new("exchange_overview")
@@ -606,6 +663,7 @@ impl Traffic {
                 );
             }
             egui::ScrollArea::both()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .id_salt(("headers", request))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -764,6 +822,7 @@ impl Traffic {
                 }
             });
             egui::ScrollArea::both()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .id_salt(("json_body", event.id, request))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -814,6 +873,7 @@ impl Traffic {
                 data.text.as_ref().unwrap_or(&data.hex)
             };
             egui::ScrollArea::both()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .id_salt(("text_body", event.id, request, self.page))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -915,4 +975,73 @@ fn load_body(snapshot: &BodySnapshot, key: LoadKey) -> Result<BodyView, String> 
         pretty,
         hex,
     })
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    fn sample() -> Row {
+        let mut event = Row::empty().event;
+        event.method = "POST".into();
+        event.url = "https://example.test/api?limit=20".into();
+        {
+            let mut exchange = event.exchange.lock().unwrap();
+            exchange.status = Some(403);
+            exchange
+                .request_headers
+                .push(("Authorization".into(), "fixture-request-token".into()));
+            exchange
+                .response_headers
+                .push(("X-Result".into(), "response-marker".into()));
+            exchange
+                .response_trailers
+                .push(("X-Trailer".into(), "trailer-marker".into()));
+            exchange.error = Some("CertificateUnknown".into());
+            exchange.note = Some("fixture capture note".into());
+        }
+        Row::new(event)
+    }
+
+    #[test]
+    fn search_includes_headers_trailers_errors_and_notes() {
+        let row = sample();
+        let mut viewer = Viewer::default();
+        for query in [
+            "fixture-request-token",
+            "response-marker",
+            "trailer-marker",
+            "CERTIFICATEUNKNOWN",
+            "fixture capture note",
+            "limit=20",
+        ] {
+            viewer.filters.query = query.into();
+            assert!(viewer.matches(&row), "query {query}");
+        }
+        viewer.filters.query = "not-in-this-session".into();
+        assert!(!viewer.matches(&row));
+    }
+
+    #[test]
+    fn every_column_can_filter_and_filters_combine() {
+        let row = sample();
+        let mut viewer = Viewer::default();
+        for (column, value) in row.values.iter().enumerate() {
+            viewer.filters.columns = Default::default();
+            viewer.filters.columns[column] = value.to_uppercase();
+            assert!(viewer.matches(&row), "column {column}");
+            viewer.filters.columns[column] = "does-not-match".into();
+            assert!(!viewer.matches(&row), "column {column}");
+        }
+        viewer.filters.columns = Default::default();
+        viewer.filters.columns[1] = "post".into();
+        viewer.filters.columns[2] = "example.test".into();
+        viewer.filters.query = "response-marker".into();
+        viewer.filters.filter = 1;
+        assert!(viewer.matches(&row));
+        viewer.filters.filter = 2;
+        assert!(!viewer.matches(&row));
+        viewer.filters = Filters::default();
+        assert!(viewer.matches(&row));
+    }
 }

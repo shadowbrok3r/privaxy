@@ -7,6 +7,7 @@ mod diagnostics;
 mod network;
 mod pairing;
 mod traffic;
+mod traffic_search;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -216,6 +217,24 @@ impl App {
 }
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Keep a full-width, opaque track even when idle. egui 0.37's solid geometry can
+        // invert the vertical handle when a wide table is clipped by horizontal scrolling;
+        // fixed-width floating geometry pins it to the visible edge and still reserves space.
+        ui.style_mut().spacing.scroll = egui::style::ScrollStyle {
+            bar_width: 12.0,
+            handle_min_length: 32.0,
+            foreground_color: true,
+            floating: true,
+            floating_width: 12.0,
+            floating_allocated_width: 12.0,
+            dormant_background_opacity: 1.0,
+            active_background_opacity: 1.0,
+            interact_background_opacity: 1.0,
+            dormant_handle_opacity: 1.0,
+            active_handle_opacity: 1.0,
+            interact_handle_opacity: 1.0,
+            ..egui::style::ScrollStyle::solid()
+        };
         if self.relay.as_ref().is_some_and(|task| task.is_finished()) {
             self.relay = None;
         }
