@@ -131,6 +131,10 @@ once per domain. The traffic table's **Client** column shows the app. Right-clic
 sessions, or use **Decrypt** beside its client in the inspector's **Overview**, to add or remove
 the app at once; the change is saved immediately. Apps that pin certificates, or that only trust
 system CAs (most apps other than browsers), refuse decryption and pass through encrypted.
+**Add apps automatically** decrypts the first connections of every phone app, listed or not:
+apps that accept the inspection CA join the list, and apps that refuse are remembered and pass
+through encrypted from then on (a refusing app may fail those first connections once). **Retry**
+forgets the remembered refusals.
 
 Tunnels and decrypted sessions stay open while traffic flows and close after an hour without
 any, so push and chat connections are not cut off. The traffic table remembers its column

@@ -341,6 +341,13 @@ pub(crate) async fn serve_tunnel<IO>(
             return;
         }
 
+        // An app off the decrypt list, tried while learning: its answer decides later connections.
+        let trial = peer
+            .app
+            .as_ref()
+            .and_then(|app| app.package.clone())
+            .filter(|package| proxy.inspection.trial(package));
+
         let hello = tokio::time::timeout(
             TLS_TIMEOUT,
             LazyConfigAcceptor::new(rustls::server::Acceptor::default(), io),
@@ -384,6 +391,9 @@ pub(crate) async fn serve_tunnel<IO>(
                         proxy.inspection.reject(&authority, reason),
                         &authority,
                     ));
+                    if let Some(package) = &trial {
+                        proxy.inspection.learn_app(package, false);
+                    }
                 }
                 drop(failed);
                 if error.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -400,6 +410,9 @@ pub(crate) async fn serve_tunnel<IO>(
                 let mut failed = exchange.lock().unwrap();
                 failed.fail("TLS handshake timed out after the client hello");
                 failed.note = Some(refused_note(passing, &authority));
+                if let Some(package) = &trial {
+                    proxy.inspection.learn_app(package, false);
+                }
                 log::debug!("TLS handshake timed out for {}", authority);
                 return;
             }
@@ -413,14 +426,19 @@ pub(crate) async fn serve_tunnel<IO>(
         let established = Instant::now();
         let requested = Arc::new(AtomicBool::new(false));
         let service = {
-            let (requested, authority, proxy, peer) = (
+            let (requested, authority, proxy, peer, trial) = (
                 requested.clone(),
                 authority.clone(),
                 proxy.clone(),
                 peer.clone(),
+                trial.clone(),
             );
             service_fn(move |req| {
-                requested.store(true, Ordering::Relaxed);
+                if !requested.swap(true, Ordering::Relaxed)
+                    && let Some(package) = &trial
+                {
+                    proxy.inspection.learn_app(package, true);
+                }
                 serve(
                     proxy.clone(),
                     req,
@@ -457,6 +475,9 @@ pub(crate) async fn serve_tunnel<IO>(
             let passing = proxy
                 .inspection
                 .reject(&authority, "Ended after handshake".into());
+            if let Some(package) = &trial {
+                proxy.inspection.learn_app(package, false);
+            }
             let mut ended = exchange.lock().unwrap();
             ended.fail(
                 "The connection ended right after the TLS handshake, before any HTTP request.",
@@ -484,7 +505,7 @@ pub(crate) fn passthrough(
     let undecrypted_app = app.filter(|app| {
         !proxy
             .inspection
-            .decrypts_app(app.package.as_deref().unwrap_or_default())
+            .tries_app(app.package.as_deref().unwrap_or_default())
     });
     if proxy.exclusions.contains(authority.host()) {
         Some("Host excluded from HTTPS inspection. Encrypted tunnel bytes are not decoded.".into())
@@ -493,10 +514,17 @@ pub(crate) fn passthrough(
             "Port {port} is not inspected, so this tunnel passes through encrypted. If it carries HTTPS, add the port under Settings > HTTPS inspection."
         ))
     } else if let Some(app) = undecrypted_app {
-        Some(format!(
-            "{} is not on Decrypt these Android apps, so its connections pass through encrypted.",
-            app.describe()
-        ))
+        Some(if proxy.inspection.learns_apps() {
+            format!(
+                "{} refused the inspection certificate or was taken off Decrypt these Android apps, so its connections pass through encrypted. Retry it under Settings > HTTPS inspection.",
+                app.describe()
+            )
+        } else {
+            format!(
+                "{} is not on Decrypt these Android apps, so its connections pass through encrypted. Right-click its session to decrypt it, or turn on Add apps automatically in Settings.",
+                app.describe()
+            )
+        })
     } else {
         proxy.inspection.rejection(authority).map(|rejection| {
             format!(
@@ -967,6 +995,84 @@ mod tests {
                 Some("com.instagram.android".to_owned()),
                 Some("com.android.chrome".to_owned()),
                 Some("com.android.chrome".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unlisted_apps_are_tried_while_learning_and_keep_their_answer() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let port = echo().await;
+        // Domain refusals stay off, so only the app's own answer can send it through.
+        let inspection = Inspection::new(BTreeSet::from([port]), false);
+        inspection.set_decrypted_apps(&["com.android.chrome".to_owned()]);
+        inspection.set_app_learning(true, &[]);
+        let root = tempfile::tempdir().unwrap();
+        let capture = CaptureStore::new(root.path()).unwrap();
+        let (proxy, ca) = proxy(inspection.clone(), capture.clone()).await;
+        let mut trusted = rustls::RootCertStore::empty();
+        trusted.add(ca).unwrap();
+        let localhost = format!("localhost:{port}");
+
+        // An app that trusts the CA is decrypted on its first connection and joins the list.
+        let (status, stream) =
+            connect_with(proxy, &localhost, "Privaxy-App: com.example.trusting\r\n").await;
+        assert_eq!(status, 200);
+        let mut tls = handshake(stream, trusted, &localhost, Vec::new())
+            .await
+            .unwrap();
+        let request = format!("GET / HTTP/1.1\r\nHost: {localhost}\r\nConnection: close\r\n\r\n");
+        tls.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        let _ = tls.read_to_end(&mut response).await;
+        assert!(response.starts_with(b"HTTP/1.1 "), "{response:?}");
+        assert!(inspection.decrypts_app("com.example.trusting"));
+
+        // An app that hangs up on the certificate passes through from then on.
+        let (_, mut stream) =
+            connect_with(proxy, &localhost, "Privaxy-App: com.example.pinned\r\n").await;
+        stream.write_all(&client_hello("localhost")).await.unwrap();
+        let mut record = [0; 5];
+        stream.read_exact(&mut record).await.unwrap();
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while inspection.trial("com.example.pinned") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (status, mut stream) =
+            connect_with(proxy, &localhost, "Privaxy-App: com.example.pinned\r\n").await;
+        assert_eq!(status, 200);
+        stream.write_all(b"pinned").await.unwrap();
+        let mut echoed = [0; 6];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&echoed, b"pinned");
+        let note = capture
+            .events()
+            .last()
+            .and_then(|event| event.exchange.lock().unwrap().note.clone())
+            .unwrap_or_default();
+        assert!(
+            note.contains("refused the inspection certificate"),
+            "{note}"
+        );
+
+        assert_eq!(
+            inspection.take_app_verdicts(),
+            [
+                crate::inspection::AppVerdict {
+                    package: "com.example.trusting".into(),
+                    accepted: true
+                },
+                crate::inspection::AppVerdict {
+                    package: "com.example.pinned".into(),
+                    accepted: false
+                },
             ]
         );
     }

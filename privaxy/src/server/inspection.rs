@@ -5,7 +5,7 @@ use rustls::AlertDescription;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::sync::{
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
     atomic::{AtomicBool, Ordering},
 };
 use wildmatch::WildMatch;
@@ -37,6 +37,14 @@ impl Rejection {
     }
 }
 
+/// How an app off the decrypted list answered the connections tried while learning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppVerdict {
+    pub package: String,
+    /// It sent a request over a decrypted connection; otherwise it refused the inspection CA.
+    pub accepted: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Inspection(Arc<State>);
 
@@ -46,6 +54,11 @@ struct State {
     pass_rejected: AtomicBool,
     // Android packages whose relayed connections are decrypted.
     apps: RwLock<Vec<WildMatch>>,
+    // Whether other packages are tried, and those that are not.
+    learning: AtomicBool,
+    passed_apps: RwLock<BTreeSet<String>>,
+    // Verdicts waiting to be saved; also serialises learning.
+    verdicts: Mutex<Vec<AppVerdict>>,
     // Keyed by domain and port, not by client.
     rejected: RwLock<Rejected>,
 }
@@ -62,6 +75,9 @@ impl Inspection {
             ports: RwLock::new(ports),
             pass_rejected: AtomicBool::new(pass_rejected),
             apps: RwLock::default(),
+            learning: AtomicBool::new(false),
+            passed_apps: RwLock::default(),
+            verdicts: Mutex::default(),
             rejected: RwLock::default(),
         }))
     }
@@ -96,6 +112,71 @@ impl Inspection {
             .unwrap()
             .iter()
             .any(|pattern| pattern.matches(&package))
+    }
+
+    /// Tries packages off the decrypted list, except `passed`, while `learning` is on.
+    pub fn set_app_learning<'a>(
+        &self,
+        learning: bool,
+        passed: impl IntoIterator<Item = &'a String>,
+    ) {
+        self.0.learning.store(learning, Ordering::Relaxed);
+        *self.0.passed_apps.write().unwrap() = passed
+            .into_iter()
+            .map(|app| app.trim().to_ascii_lowercase())
+            .collect();
+    }
+
+    /// Whether apps off the decrypted list are tried.
+    pub fn learns_apps(&self) -> bool {
+        self.0.learning.load(Ordering::Relaxed)
+    }
+
+    /// Whether connections from `package` are decrypted, listed or tried.
+    pub(crate) fn tries_app(&self, package: &str) -> bool {
+        self.decrypts_app(package) || self.trial(package)
+    }
+
+    /// Whether `package` is off the list but tried while learning.
+    pub(crate) fn trial(&self, package: &str) -> bool {
+        !package.is_empty()
+            && self.learns_apps()
+            && !self.decrypts_app(package)
+            && !self
+                .0
+                .passed_apps
+                .read()
+                .unwrap()
+                .contains(&package.to_ascii_lowercase())
+    }
+
+    /// Records a tried app's answer: one that accepts is decrypted from then on, one that refuses passes through.
+    pub(crate) fn learn_app(&self, package: &str, accepted: bool) {
+        let mut verdicts = self.0.verdicts.lock().unwrap();
+        if !self.trial(package) {
+            return;
+        }
+        let package = package.to_ascii_lowercase();
+        if accepted {
+            self.0.apps.write().unwrap().push(WildMatch::new(&package));
+        } else {
+            self.0.passed_apps.write().unwrap().insert(package.clone());
+        }
+        log::info!(
+            "{package} {} decryption; {}",
+            if accepted { "accepted" } else { "refused" },
+            if accepted {
+                "decrypting its connections from now on"
+            } else {
+                "passing its connections through"
+            }
+        );
+        verdicts.push(AppVerdict { package, accepted });
+    }
+
+    /// Verdicts recorded since the last call.
+    pub fn take_app_verdicts(&self) -> Vec<AppVerdict> {
+        std::mem::take(&mut *self.0.verdicts.lock().unwrap())
     }
 
     /// The earlier refusal that sends this authority through undecrypted.
@@ -393,6 +474,45 @@ mod tests {
         }
         inspection.set_decrypted_apps(&["*".to_owned()]);
         assert!(inspection.decrypts_app("com.instagram.android"));
+    }
+
+    #[test]
+    fn learning_tries_unlisted_apps_once_and_keeps_their_answer() {
+        let inspection = Inspection::new(BTreeSet::from(DEFAULT_PORTS), true);
+        inspection.set_decrypted_apps(&["com.android.chrome".to_owned()]);
+        assert!(!inspection.tries_app("com.example.trusting"));
+        inspection.set_app_learning(true, &["com.example.passed".to_owned()]);
+        for app in ["com.example.trusting", "com.example.pinned"] {
+            assert!(inspection.trial(app) && inspection.tries_app(app), "{app}");
+        }
+        assert!(!inspection.tries_app("com.example.passed"));
+        assert!(!inspection.trial("com.android.chrome") && !inspection.trial(""));
+
+        inspection.learn_app("com.example.trusting", true);
+        inspection.learn_app("com.example.pinned", false);
+        inspection.learn_app("com.example.pinned", false);
+        inspection.learn_app("com.example.trusting", false);
+        assert!(inspection.decrypts_app("com.example.trusting"));
+        assert!(!inspection.tries_app("com.example.pinned"));
+        assert_eq!(
+            inspection.take_app_verdicts(),
+            [
+                AppVerdict {
+                    package: "com.example.trusting".into(),
+                    accepted: true
+                },
+                AppVerdict {
+                    package: "com.example.pinned".into(),
+                    accepted: false
+                },
+            ]
+        );
+        assert!(inspection.take_app_verdicts().is_empty());
+
+        inspection.set_app_learning(false, &[]);
+        assert!(!inspection.tries_app("com.example.new"));
+        inspection.learn_app("com.example.new", false);
+        assert!(inspection.take_app_verdicts().is_empty());
     }
 
     #[test]

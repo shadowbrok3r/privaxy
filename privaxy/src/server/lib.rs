@@ -90,6 +90,7 @@ pub async fn try_start_privaxy() -> Result<PrivaxyServer, String> {
         configuration.pass_through_rejected,
     );
     inspection.set_decrypted_apps(&configuration.decrypted_apps);
+    inspection.set_app_learning(configuration.learn_apps, &configuration.pass_through_apps);
     let inspection_clone = inspection.clone();
     let (lan_proxy, lan_clients) = (configuration.lan_proxy, configuration.lan_clients.clone());
 

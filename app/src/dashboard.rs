@@ -790,7 +790,49 @@ impl App {
                     egui::vec2(column, half),
                 ),
                 |ui| {
-                    field_label(ui, "Decrypt these Android apps").on_hover_text("Package names, one per line; * matches anything. Connections from other apps on a paired phone pass through encrypted from the start, since Android apps other than browsers refuse user-installed CAs. Saved with the settings; right-clicking a phone app's session under Traffic adds or removes it at once.");
+                    let t = Tokens::get(ui.ctx());
+                    ui.horizontal_wrapped(|ui| {
+                        field_label(ui, "Decrypt these Android apps").on_hover_text("Package names, one per line; * matches anything. Connections from other apps on a paired phone pass through encrypted, since Android apps other than browsers mostly refuse user-installed CAs. Saved with the settings; right-clicking a phone app's session under Traffic adds or removes it at once.");
+                        let mut learn = cfg.learn_apps;
+                        if ui
+                            .add_enabled(server.is_some(), egui::Checkbox::new(&mut learn, "Add apps automatically"))
+                            .on_hover_text("Decrypts the first connections of every phone app, listed or not. Apps that accept the inspection CA are added here; apps that refuse are remembered and pass through encrypted from then on. A refusing app may fail those first connections once. Saved at once.")
+                            .changed()
+                            && let Some(server) = server
+                        {
+                            cfg.learn_apps = learn;
+                            server.inspection.set_app_learning(learn, &cfg.pass_through_apps);
+                            self.save_config(cfg.clone(), server);
+                        }
+                    });
+                    if cfg.learn_apps && !cfg.pass_through_apps.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            let count = cfg.pass_through_apps.len();
+                            ui.label(
+                                RichText::new(if count == 1 {
+                                    "1 app passes through".to_owned()
+                                } else {
+                                    format!("{count} apps pass through")
+                                })
+                                .color(t.warn),
+                            )
+                            .on_hover_text(format!(
+                                "Not tried while adding apps automatically: they refused the inspection CA or were taken off this list.\n\n{}",
+                                cfg.pass_through_apps.iter().cloned().collect::<Vec<_>>().join("\n")
+                            ));
+                            let retry = crate::accent::action_widget(ui, svg::ARROWS_CLOCKWISE, "Retry", t.primary).small();
+                            if ui
+                                .add_enabled(server.is_some(), retry)
+                                .on_hover_text("Tries these apps again on their next connection.")
+                                .clicked()
+                                && let Some(server) = server
+                            {
+                                cfg.pass_through_apps.clear();
+                                server.inspection.set_app_learning(cfg.learn_apps, &cfg.pass_through_apps);
+                                self.save_config(cfg.clone(), server);
+                            }
+                        });
+                    }
                     ui.add_space(4.);
                     fill_text(ui, "decrypted_apps", &mut self.decrypted_apps, "com.android.chrome");
                 },

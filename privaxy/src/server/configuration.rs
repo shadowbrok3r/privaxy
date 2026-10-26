@@ -129,6 +129,12 @@ pub struct Configuration {
     /// Android packages, `*` wildcards allowed, whose relayed connections are decrypted; other apps pass through.
     #[serde(default = "default_decrypted_apps")]
     pub decrypted_apps: BTreeSet<String>,
+    /// Decrypts apps off `decrypted_apps` until they answer: those that accept join it.
+    #[serde(default)]
+    pub learn_apps: bool,
+    /// Apps not tried while learning: they refused the inspection CA or were taken off the list.
+    #[serde(default)]
+    pub pass_through_apps: BTreeSet<String>,
     /// Serves the proxy on every interface to the clients in `lan_clients`.
     #[serde(default)]
     pub lan_proxy: bool,
@@ -378,6 +384,8 @@ impl Configuration {
             inspected_ports: default_inspected_ports(),
             pass_through_rejected: true,
             decrypted_apps: default_decrypted_apps(),
+            learn_apps: false,
+            pass_through_apps: BTreeSet::new(),
             lan_proxy: false,
             lan_clients: default_lan_clients(),
             system_proxy: false,
@@ -552,6 +560,8 @@ mod tests {
             inspected_ports: BTreeSet::from([443, 9443]),
             pass_through_rejected: false,
             decrypted_apps: BTreeSet::from(["com.android.chrome".into()]),
+            learn_apps: true,
+            pass_through_apps: BTreeSet::from(["com.instagram.android".into()]),
             lan_proxy: true,
             lan_clients: BTreeSet::from(["192.168.4.0/24".into()]),
             system_proxy: true,
@@ -631,6 +641,7 @@ mod tests {
         assert!(loaded.pass_through_rejected && !loaded.observe_only);
         assert!(loaded.decrypted_apps.contains("com.android.chrome"));
         assert!(!loaded.decrypted_apps.contains("com.instagram.android"));
+        assert!(!loaded.learn_apps && loaded.pass_through_apps.is_empty());
         assert!(!loaded.lan_proxy && !loaded.system_proxy);
         assert!(loaded.lan_clients.contains("192.168.0.0/16"));
     }

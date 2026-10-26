@@ -281,15 +281,35 @@ impl App {
             label,
             decrypt,
         } = change;
+        self.set_apps(server, &[(package, decrypt)]);
+        *self.notice.lock().unwrap() = if decrypt {
+            format!(
+                "Decrypting {label} from its next connection. Apps that pin certificates or ignore user-installed CAs refuse and pass through encrypted."
+            )
+        } else {
+            format!("{label} passes through encrypted from its next connection.")
+        };
+    }
+    /// Saves which apps are decrypted; the others are kept from being tried while learning.
+    fn set_apps(&mut self, server: &PrivaxyServer, apps: &[(String, bool)]) {
         self.update_config(server, |cfg| {
-            cfg.decrypted_apps
-                .retain(|app| !app.trim().eq_ignore_ascii_case(&package));
-            if decrypt {
-                cfg.decrypted_apps.insert(package.clone());
+            for (package, decrypt) in apps {
+                cfg.decrypted_apps
+                    .retain(|app| !app.trim().eq_ignore_ascii_case(package));
+                cfg.pass_through_apps
+                    .retain(|app| !app.eq_ignore_ascii_case(package));
+                if *decrypt {
+                    cfg.decrypted_apps.insert(package.clone());
+                } else {
+                    cfg.pass_through_apps.insert(package.clone());
+                }
             }
         });
         if let Some(cfg) = self.config.lock().unwrap().as_ref() {
             server.inspection.set_decrypted_apps(&cfg.decrypted_apps);
+            server
+                .inspection
+                .set_app_learning(cfg.learn_apps, &cfg.pass_through_apps);
             if let Some(saved) = &mut self.settings_saved {
                 saved.decrypted_apps = cfg.decrypted_apps.clone();
             }
@@ -299,19 +319,31 @@ impl App {
             .decrypted_apps
             .lines()
             .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.eq_ignore_ascii_case(&package))
+            .filter(|line| {
+                !line.is_empty()
+                    && !apps
+                        .iter()
+                        .any(|(package, _)| line.eq_ignore_ascii_case(package))
+            })
             .collect();
-        if decrypt {
-            lines.push(&package);
-        }
+        lines.extend(
+            apps.iter()
+                .filter(|(_, decrypt)| *decrypt)
+                .map(|(package, _)| package.as_str()),
+        );
         self.decrypted_apps = lines.join("\n");
-        *self.notice.lock().unwrap() = if decrypt {
-            format!(
-                "Decrypting {label} from its next connection. Apps that pin certificates or ignore user-installed CAs refuse and pass through encrypted."
-            )
-        } else {
-            format!("{label} passes through encrypted from its next connection.")
-        };
+    }
+    /// Saves how the apps tried while learning answered.
+    fn absorb_app_verdicts(&mut self, server: &PrivaxyServer) {
+        let apps: Vec<_> = server
+            .inspection
+            .take_app_verdicts()
+            .into_iter()
+            .map(|verdict| (verdict.package, verdict.accepted))
+            .collect();
+        if !apps.is_empty() {
+            self.set_apps(server, &apps);
+        }
     }
     fn set_system_proxy(&self, on: bool, server: &PrivaxyServer) {
         self.update_config(server, |cfg| cfg.system_proxy = on);
@@ -398,6 +430,9 @@ impl App {
                     .inspection
                     .configure(config.inspected_ports.clone(), config.pass_through_rejected);
                 server.inspection.set_decrypted_apps(&config.decrypted_apps);
+                server
+                    .inspection
+                    .set_app_learning(config.learn_apps, &config.pass_through_apps);
                 let invalid = server.listener.serve_lan(config.lan_proxy, &config.lan_clients);
                 server
                     .configuration_updater_sender
@@ -444,6 +479,9 @@ impl eframe::App for App {
             self.relay = None;
         }
         let server = self.server.lock().unwrap().clone();
+        if let Some(server) = &server {
+            self.absorb_app_verdicts(server);
+        }
         TitleBar::new("privaxy.title", "Privaxy")
             .frameless(self.chrome.frameless)
             .show(ui, |ui, side| match side {
