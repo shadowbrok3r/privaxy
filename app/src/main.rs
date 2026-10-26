@@ -2,13 +2,29 @@ use eframe::egui;
 use egui_icon_pack::{phosphor_regular as svg, widgets as icons};
 use egui_theme_kit::{chrome, picker, store::JsonDirStore, title_bar::TitleBar};
 use privaxy::{PrivaxyServer, events::Event, listener::ListenerStatus};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+mod connect;
 mod dashboard;
 mod diagnostics;
 mod network;
+mod network_capture;
 mod pairing;
 mod traffic;
 mod traffic_search;
+
+/// Network-level capture, as far as it got.
+#[derive(Default)]
+enum Capture {
+    #[default]
+    Off,
+    /// Waiting for administrator authorization and the firewall rules.
+    Starting,
+    /// The helper holding the firewall rules; dropping it removes them.
+    On(#[allow(dead_code)] network_capture::NetworkCapture),
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -32,6 +48,9 @@ struct App {
     logs: diagnostics::LogView,
     custom: String,
     exclusions: String,
+    ports: String,
+    decrypted_apps: String,
+    lan_clients: String,
     drafts_loaded: bool,
     identity: Option<pairing::Identity>,
     relay: Option<tokio::task::JoinHandle<()>>,
@@ -40,10 +59,12 @@ struct App {
     host: String,
     addresses: network::Addresses,
     notice: Arc<Mutex<String>>,
-    setup_open: bool,
-    pairing_open: bool,
+    pairing_qr: bool,
     revoke_confirm: bool,
-    checking_proxy: Arc<std::sync::atomic::AtomicBool>,
+    checking_proxy: Arc<AtomicBool>,
+    /// The desktop's proxy settings point at Privaxy.
+    system_proxy: Arc<AtomicBool>,
+    network_capture: Arc<Mutex<Capture>>,
 }
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, chrome: chrome::Chrome) -> Self {
@@ -71,6 +92,9 @@ impl App {
             logs: Default::default(),
             custom: String::new(),
             exclusions: String::new(),
+            ports: String::new(),
+            decrypted_apps: String::new(),
+            lan_clients: String::new(),
             drafts_loaded: false,
             identity: identity.ok(),
             relay: None,
@@ -79,20 +103,23 @@ impl App {
             host,
             addresses,
             notice: Arc::new(Mutex::new(notice)),
-            setup_open: false,
-            pairing_open: false,
+            pairing_qr: false,
             revoke_confirm: false,
             checking_proxy: Arc::default(),
+            system_proxy: Arc::default(),
+            network_capture: Arc::default(),
         };
         app.initialize_backend();
         app
     }
     fn initialize_backend(&self) {
         *self.startup_error.lock().unwrap() = None;
-        let (server, config, error) = (
+        let (server, config, error, system_proxy, notice) = (
             self.server.clone(),
             self.config.clone(),
             self.startup_error.clone(),
+            self.system_proxy.clone(),
+            self.notice.clone(),
         );
         self.runtime.spawn(async move {
             let backend = match privaxy::try_start_privaxy().await {
@@ -107,7 +134,25 @@ impl App {
             match privaxy::configuration::Configuration::read_from_home(reqwest::Client::new())
                 .await
             {
-                Ok(cfg) => *config.lock().unwrap() = Some(cfg),
+                Ok(cfg) => {
+                    let wanted = cfg.system_proxy;
+                    *config.lock().unwrap() = Some(cfg);
+                    let applied = tokio::task::spawn_blocking(move || {
+                        let proxy = connect::SystemProxy::detect()?;
+                        if wanted && !proxy.is_active() {
+                            proxy.apply()?;
+                        }
+                        Ok::<_, String>(proxy.is_active())
+                    })
+                    .await;
+                    match applied {
+                        Ok(Ok(active)) => system_proxy.store(active, Ordering::Relaxed),
+                        Ok(Err(reason)) if wanted => {
+                            *notice.lock().unwrap() = format!("System proxy: {reason}")
+                        }
+                        _ => {}
+                    }
+                }
                 Err(reason) => *error.lock().unwrap() = Some(reason.to_string()),
             }
         });
@@ -198,6 +243,104 @@ impl App {
             running.store(false, Ordering::Relaxed);
         });
     }
+    /// Saves the configuration without reloading filters.
+    fn save_config(&self, config: privaxy::configuration::Configuration, server: &PrivaxyServer) {
+        let (lock, notice) = (server.configuration_save_lock.clone(), self.notice.clone());
+        self.runtime.spawn(async move {
+            let _guard = lock.lock().await;
+            if let Err(error) = config.save().await {
+                *notice.lock().unwrap() = format!("Could not save settings: {error}");
+            }
+        });
+    }
+    /// Changes a configuration field in memory and on disk.
+    fn update_config(
+        &self,
+        server: &PrivaxyServer,
+        change: impl FnOnce(&mut privaxy::configuration::Configuration),
+    ) {
+        let config = {
+            let mut config = self.config.lock().unwrap();
+            config.as_mut().map(|cfg| {
+                change(cfg);
+                cfg.clone()
+            })
+        };
+        if let Some(config) = config {
+            self.save_config(config, server);
+        }
+    }
+    fn set_system_proxy(&self, on: bool, server: &PrivaxyServer) {
+        self.update_config(server, |cfg| cfg.system_proxy = on);
+        let (state, notice) = (self.system_proxy.clone(), self.notice.clone());
+        std::thread::spawn(move || {
+            let result = connect::SystemProxy::detect().and_then(|proxy| {
+                if on { proxy.apply() } else { proxy.restore() }?;
+                Ok(proxy.is_active())
+            });
+            match result {
+                Ok(active) => state.store(active, Ordering::Relaxed),
+                Err(reason) => *notice.lock().unwrap() = format!("System proxy: {reason}"),
+            }
+        });
+    }
+    fn set_lan_proxy(&self, on: bool, server: &PrivaxyServer) {
+        self.update_config(server, |cfg| cfg.lan_proxy = on);
+        let clients = self
+            .config
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|cfg| cfg.lan_clients.clone())
+            .unwrap_or_default();
+        let invalid = server.listener.serve_lan(on, &clients);
+        if !invalid.is_empty() {
+            *self.notice.lock().unwrap() = format!(
+                "Ignored LAN clients that are not addresses or ranges: {}",
+                invalid.join(", ")
+            );
+        }
+        log::info!("LAN proxy {}", if on { "enabled" } else { "disabled" });
+    }
+    fn set_network_capture(&self, on: bool, server: &PrivaxyServer) {
+        if !on {
+            let previous = std::mem::take(&mut *self.network_capture.lock().unwrap());
+            server.network_capture.stop();
+            std::thread::spawn(move || drop(previous));
+            log::info!("Network capture disabled");
+            return;
+        }
+        let mut ports: Vec<u16> = self
+            .config
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|cfg| cfg.inspected_ports.iter().copied().collect())
+            .unwrap_or_else(|| privaxy::inspection::DEFAULT_PORTS.to_vec());
+        ports.insert(0, 80);
+        ports.dedup();
+        server.network_capture.start();
+        *self.network_capture.lock().unwrap() = Capture::Starting;
+        let (state, notice, listener) = (
+            self.network_capture.clone(),
+            self.notice.clone(),
+            server.network_capture.clone(),
+        );
+        std::thread::spawn(move || {
+            match network_capture::NetworkCapture::start(&ports, privaxy::transparent::PORT) {
+                Ok(capture) => {
+                    log::info!("Network capture enabled for ports {ports:?}");
+                    *state.lock().unwrap() = Capture::On(capture);
+                }
+                Err(reason) => {
+                    log::warn!("Network capture failed: {reason}");
+                    *state.lock().unwrap() = Capture::Off;
+                    listener.stop();
+                    *notice.lock().unwrap() = format!("Network capture is off: {reason}");
+                }
+            }
+        });
+    }
     fn save_settings(&self, config: privaxy::configuration::Configuration, server: &PrivaxyServer) {
         let (mut server, notice) = (server.clone(), self.notice.clone());
         self.runtime.spawn(async move {
@@ -209,10 +352,23 @@ impl App {
                     .local_exclusion_store
                     .replace_exclusions(config.exclusions.iter().cloned().collect());
                 server
+                    .inspection
+                    .configure(config.inspected_ports.clone(), config.pass_through_rejected);
+                server.inspection.set_decrypted_apps(&config.decrypted_apps);
+                let invalid = server.listener.serve_lan(config.lan_proxy, &config.lan_clients);
+                server
                     .configuration_updater_sender
                     .send(config)
                     .await
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string())?;
+                if invalid.is_empty() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Settings saved; filters reloading. Ignored LAN clients that are not addresses or ranges: {}",
+                        invalid.join(", ")
+                    ))
+                }
             }
             .await;
             *notice.lock().unwrap() = result
@@ -276,7 +432,6 @@ impl eframe::App for App {
                     .clicked()
                     {
                         self.tab = Tab::Dashboard;
-                        self.pairing_open = true;
                     }
                 }
             });
@@ -325,15 +480,10 @@ impl eframe::App for App {
                             .show(ui, server.as_ref(), &events, self.notice.clone())
                     }
                     Tab::Logs => self.logs.show(ui, self.notice.clone()),
-                    Tab::Settings => {
-                        egui::ScrollArea::vertical()
-                            .id_salt("settings")
-                            .show(ui, |ui| self.settings(ui, server.as_ref()))
-                            .inner
-                    }
+                    Tab::Settings => self.settings(ui, server.as_ref()),
                 }
             });
-        self.dialogs(ui.ctx(), server.as_ref());
+        self.dialogs(ui.ctx());
         picker::window(ui.ctx(), &mut self.picker, &*self.store);
         if self.chrome.frameless {
             egui_theme_kit::title_bar::window_edges(ui);
@@ -341,11 +491,28 @@ impl eframe::App for App {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(250));
     }
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui_theme_kit::Tokens::get(&self.ctx)
+            .base
+            .to_normalized_gamma_f32()
+    }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         egui_theme_kit::save(&self.ctx, storage);
     }
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        drop(std::mem::take(&mut *self.network_capture.lock().unwrap()));
+        if self.system_proxy.load(Ordering::Relaxed)
+            && let Err(error) = connect::SystemProxy::detect().and_then(|proxy| proxy.release())
+        {
+            log::error!("Could not restore the system proxy settings: {error}");
+        }
+    }
 }
 fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(network_capture::HELPER_FLAG) {
+        std::process::exit(network_capture::run_helper(&args[2..]));
+    }
     let _ = privaxy_diagnostics::init(None);
     let logs = dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)

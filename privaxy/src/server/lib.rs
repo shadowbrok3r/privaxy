@@ -21,10 +21,12 @@ pub mod capture;
 mod cert;
 pub mod configuration;
 pub mod events;
+pub mod inspection;
 pub mod listener;
 mod proxy;
 pub mod statistics;
 pub mod storage;
+pub mod transparent;
 
 // Shorter timeout for idle connections
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -39,6 +41,11 @@ pub struct PrivaxyServer {
     pub blocking_disabled_store: blocker::BlockingDisabledStore,
     pub statistics: statistics::Statistics,
     pub local_exclusion_store: LocalExclusionStore,
+    pub inspection: inspection::Inspection,
+    /// Network-level capture: connections the firewall redirects to port 8103 on loopback.
+    pub network_capture: transparent::TransparentListener,
+    /// SHA-256 of the inspection CA's public key, base64, as Chromium's `--ignore-certificate-errors-spki-list` takes it.
+    pub ca_spki_sha256: String,
     // A Sender is required to subscribe to broadcasted messages
     pub requests_broadcast_sender: broadcast::Sender<Event>,
 }
@@ -77,10 +84,19 @@ pub async fn try_start_privaxy() -> Result<PrivaxyServer, String> {
     let local_exclusion_store =
         LocalExclusionStore::new(Vec::from_iter(configuration.exclusions.clone().into_iter()));
     let local_exclusion_store_clone = local_exclusion_store.clone();
+    let inspection = inspection::Inspection::new(
+        configuration.inspected_ports.clone(),
+        configuration.pass_through_rejected,
+    );
+    inspection.set_decrypted_apps(&configuration.decrypted_apps);
+    let inspection_clone = inspection.clone();
+    let (lan_proxy, lan_clients) = (configuration.lan_proxy, configuration.lan_clients.clone());
 
     let ca_certificate = configuration.ca_certificate().map_err(|e| e.to_string())?;
     let ca_certificate_pem = String::from_utf8(ca_certificate.to_pem().map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
+    let ca_der = bytes::Bytes::from(ca_certificate.to_der().map_err(|e| e.to_string())?);
+    let ca_spki_sha256 = ca::spki_sha256(&ca_certificate).map_err(|e| e.to_string())?;
     let ca_private_key = configuration.ca_private_key().map_err(|e| e.to_string())?;
 
     let cert_cache = cert::CertCache::new(ca_certificate, ca_private_key);
@@ -133,30 +149,31 @@ pub async fn try_start_privaxy() -> Result<PrivaxyServer, String> {
 
     let proxy_server_addr = SocketAddr::from((ip, 8100));
 
+    let proxy = proxy::mitm::Proxy {
+        adblock: blocker_requester,
+        upstream: proxy::serve::Upstream::new(client),
+        cert_cache,
+        events: broadcast_tx,
+        statistics,
+        exclusions: local_exclusion_store,
+        capture: capture_for_server,
+        inspection,
+        ca_der,
+    };
+    let network_capture = transparent::TransparentListener::spawn(proxy.clone());
     let listener = listener::ProxyListener::spawn(
         proxy_server_addr,
         move |stream, client_addr, cancellation| {
-            let client = client.clone();
-            let cert_cache = cert_cache.clone();
-            let broadcast_tx = broadcast_tx.clone();
-            let statistics = statistics.clone();
-            let blocker_requester = blocker_requester.clone();
-            let local_exclusion_store = local_exclusion_store.clone();
-            let capture = capture_for_server.clone();
+            let proxy = proxy.clone();
             async move {
+                let peer = proxy::mitm::Peer {
+                    ip: client_addr.ip(),
+                    app: None,
+                    proxy: stream.local_addr().unwrap_or(proxy_server_addr),
+                    cancellation,
+                };
                 let service = service_fn(move |req| {
-                    proxy::serve_mitm_session(
-                        blocker_requester.clone(),
-                        client.clone(),
-                        req,
-                        cert_cache.clone(),
-                        broadcast_tx.clone(),
-                        statistics.clone(),
-                        client_addr.ip(),
-                        local_exclusion_store.clone(),
-                        cancellation.clone(),
-                        capture.clone(),
-                    )
+                    proxy::serve_mitm_session(proxy.clone(), peer.clone(), req)
                 });
                 let result = tokio::time::timeout(
                     IDLE_TIMEOUT,
@@ -174,6 +191,9 @@ pub async fn try_start_privaxy() -> Result<PrivaxyServer, String> {
             }
         },
     );
+    for entry in listener.serve_lan(lan_proxy, &lan_clients) {
+        log::warn!("Ignoring LAN client {entry:?}: not an address or CIDR range");
+    }
 
     Ok(PrivaxyServer {
         capture,
@@ -184,6 +204,9 @@ pub async fn try_start_privaxy() -> Result<PrivaxyServer, String> {
         blocking_disabled_store: blocking_disabled_store_clone,
         statistics: statistics_clone,
         local_exclusion_store: local_exclusion_store_clone,
+        inspection: inspection_clone,
+        network_capture,
+        ca_spki_sha256,
         requests_broadcast_sender: broadcast_tx_clone,
     })
 }

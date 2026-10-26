@@ -28,7 +28,7 @@ and the theme preset picker under Settings. The previous Dioxus UI remains avail
 The title bar has **Dashboard**, **Traffic**, **Settings**, and **Logs**.
 Dashboard combines proxy controls, filtering, Android connection status, a live
 request chart, top destinations, and recent requests. Settings contains appearance,
-filter lists, custom rules, and HTTPS exclusions. Navigation and actions use the shared
+filter lists, custom rules, and HTTPS inspection. Navigation and actions use the shared
 Git-pinned SVG icon pack, tinted by the selected theme.
 
 Traffic uses the Git-pinned egui-data-table and egui_json_tree forks. Click a request
@@ -70,9 +70,33 @@ Downloads. Pairing credentials, headers and body payloads are not diagnostic eve
 connection endpoints and errors are included. A bounded queue reports any dropped
 file lines in the UI/export instead of blocking network workers.
 
-For desktop use, the proxy starts automatically on `127.0.0.1:8100`. Choose
-**Connect this computer** on Dashboard for browser/system setup and CA export.
-Configure both HTTP and HTTPS proxy fields with host `127.0.0.1`, port `8100`.
+For desktop use, the proxy starts automatically on `127.0.0.1:8100`. Dashboard's
+**Desktop proxy** panel connects apps in several ways; each control's hover hint explains it.
+
+- **System proxy** points the KDE (`kioslaverc`) and GNOME (GSettings) proxy settings at
+  `127.0.0.1:8100` for apps that follow the desktop setting. The previous settings are kept in
+  `~/.privaxy/system-proxy-backup.json` and restored when you switch it off or quit; the choice
+  is applied again at the next start.
+- **Network capture** (Linux) reaches apps that ignore proxy settings. Privaxy moves itself into
+  a child cgroup, then a helper started through pkexec (administrator password) installs the
+  nftables table `inet privaxy_capture`. It redirects the current user's outbound TCP on port 80
+  and the inspected ports to `127.0.0.1:8103` / `[::1]:8103` and refuses UDP 443, so QUIC falls
+  back to TCP. Privaxy's own connections, other users and loopback are exempt. The table is
+  owned by the helper's `nft` session, so the kernel deletes it as soon as capture is switched
+  off or Privaxy, the helper or `nft` exits, even when one of them is killed.
+  The capture listener reads each connection's original destination and TLS server name, then
+  decrypts or passes it through exactly as it would a CONNECT.
+- **LAN devices** also listens on every interface, port 8100, for the addresses under
+  **Settings → LAN devices** (private, Tailscale and link-local ranges by default); loopback is
+  always allowed. Point a device's Wi-Fi proxy at this computer, and download the CA from
+  `http://<this computer>:8100/privaxy-ca.crt`.
+- **Inspected browser** starts Chromium, Chrome, Brave, Edge or Vivaldi with its own profile,
+  the proxy, and the inspection CA trusted by its key hash, so nothing is installed system-wide.
+- **Copy terminal setup** copies `export` lines for the proxy variables and CA bundles
+  (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `GIT_SSL_CAINFO`, `NODE_EXTRA_CA_CERTS`, …),
+  written to `~/.privaxy/`. They last for the shell you paste them into.
+- **Export CA** saves the inspection CA for manual installation.
+
 **Test proxy** sends a real HTTP request through the listener. **Stop proxy**
 closes the listener, active HTTP/CONNECT streams, and Android relay; **Start proxy**
 reopens it without clearing statistics or reinitializing filters. Bind errors
@@ -81,23 +105,44 @@ appear on Dashboard and can be retried after freeing the port. Android is option
 Enable **Observe only · no blocking** on Dashboard to keep inspection and capture while
 disabling ad/tracker decisions and HTML rewriting. The preference survives restarts and
 also applies to traffic from paired phones. Clients must still trust the desktop CA;
-excluded hosts pass through encrypted with metadata only. This option does not configure
-Linux transparent routing or change firewall rules.
+excluded hosts pass through encrypted with metadata only. This option does not change
+routing or firewall rules; **Network capture** does.
 
-1. Open **Pair phone / addresses** on Dashboard (or click Android status in the
-   title bar). The computer's Tailscale IPv4 address is selected
+**Settings → HTTPS inspection** decides which CONNECT tunnels are decrypted. Only ports in
+**Inspect ports** (443 and 8443 by default) are; other ports, such as Google push on 5228,
+pass through untouched. When a client refuses the inspection certificate, whether with a TLS
+alert, by hanging up during or right after the handshake, or by not answering it, as pinned
+apps such as Instagram and curl do, the host's whole registrable domain (`cdninstagram.com`
+for every `scontent-*.cdninstagram.com` shard) passes through encrypted on that port for the
+rest of the session instead of failing on every retry. Dashboard reports how many domains did
+this; Settings lists them beside **Never intercept**, with a button that adds `*.domain` (which
+also covers the bare domain) and **Retry** to inspect them again. Turn off **Pass through
+domains that refuse the certificate** to keep failing them instead. Tunnels that are not
+decrypted are still checked against hostname rules and refused when one matches.
+
+Decrypted sessions negotiate HTTP/2 when the client offers it. gRPC calls are forwarded over
+HTTP/2 with their trailers in both directions, so they are inspected instead of broken.
+
+**Decrypt these Android apps** lists the packages, `*` wildcards allowed, whose connections
+from a paired phone are decrypted. It defaults to common browsers, the only Android apps that
+trust user-installed CAs. The phone names the app behind each relayed CONNECT (`Privaxy-App`),
+so every other app's connections pass through encrypted from the first byte instead of failing
+once per domain. The traffic table's **Client** column shows the app.
+
+1. Use **Android connection** on Dashboard (clicking Android status in the title bar
+   opens Dashboard). Hover its controls for help. The computer's Tailscale IPv4 address is selected
    automatically when available, otherwise a LAN address. Every active IPv4 address
    is listed with its interface name, including separate Ethernet and Wi-Fi addresses
    and any aliases. VPN/VM/container addresses appear under **Other** and are not
    chosen as defaults. Click the address reachable from your phone to fill the field;
-   use **Refresh addresses** after changing networks (it keeps your selected address).
+   use the refresh button after changing networks (it keeps your selected address).
    Android must be connected to the same tailnet to use the
-   Tailscale address, or the same reachable LAN to use the LAN address. Enable the
-   relay, which listens on all interfaces at `0.0.0.0:8101`. Pairing codes contain
+   Tailscale address, or the same reachable LAN to use the LAN address. **Start relay**
+   listens on all interfaces at `0.0.0.0:8101`. Pairing codes contain
    the selected address. The regular HTTP proxy stays on `127.0.0.1:8100`.
-2. Scan the QR with the phone camera to open Privaxy directly on **Pairing**.
-   Review the desktop address and tap **Pair desktop**. Alternatively copy the
-   link/code into **Paste pairing code**. Existing `privaxy-pair-v1:` codes still work.
+2. **Show QR** and scan it with the phone camera to open Privaxy directly on **Pairing**.
+   Review the desktop address and tap **Pair desktop**. Alternatively **Copy link** and
+   paste it into **Paste pairing code**. Existing `privaxy-pair-v1:` codes still work.
    After pairing, edit **Desktop IP or hostname** and **Relay port** on Android,
    then **Save address** to switch networks without replacing the pinned certificate.
    The authenticated relay automatically sends its public inspection CA to updated Android

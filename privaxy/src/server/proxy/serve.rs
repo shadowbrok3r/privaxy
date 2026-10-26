@@ -1,9 +1,8 @@
-use super::mitm::{BodyError, BoxBodyType};
+use super::mitm::{BodyError, BoxBodyType, Peer, Proxy};
 use crate::{
     blocker::AdblockRequester,
     body::CaptureBody,
-    capture::{CaptureStore, Exchange, PendingResponse, header_pairs},
-    events::Event,
+    capture::{Exchange, PendingResponse, header_pairs},
     statistics::Statistics,
 };
 use adblock::blocker::BlockerResult;
@@ -16,8 +15,7 @@ use hyper::{
     Request, Response,
     body::{Frame, Incoming},
 };
-use std::net::IpAddr;
-use tokio::sync::broadcast;
+use std::sync::Arc;
 
 fn empty_body() -> BoxBodyType {
     Empty::<Bytes>::new()
@@ -54,23 +52,116 @@ fn strip_hop_headers(headers: &mut http::HeaderMap) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Clients for upstream requests: reqwest for ordinary traffic, and hyper, which keeps trailers, for gRPC.
+#[derive(Clone)]
+pub(crate) struct Upstream {
+    pub(crate) http: reqwest::Client,
+    grpc: GrpcClient,
+}
+
+type GrpcClient = hyper_util::client::legacy::Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    BoxBodyType,
+>;
+
+impl Upstream {
+    /// gRPC trusts the public web roots, as `http` does.
+    pub(crate) fn new(http: reqwest::Client) -> Self {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Self::with_roots(http, roots)
+    }
+
+    pub(crate) fn with_roots(http: reqwest::Client, roots: rustls::RootCertStore) -> Self {
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build();
+        Self {
+            http,
+            grpc: hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(connector),
+        }
+    }
+}
+
+/// gRPC over HTTP/2, which reports its status in trailers; gRPC-Web carries them in the body.
+fn is_grpc(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.starts_with("application/grpc") && !value.starts_with("application/grpc-web")
+        })
+}
+
+/// Forwards a gRPC call over HTTP/2 with its trailers in both directions.
+async fn forward_grpc(
+    client: &GrpcClient,
+    method: http::Method,
+    uri: Uri,
+    headers: http::HeaderMap,
+    body: BoxBodyType,
+) -> Result<Response<BoxBodyType>, String> {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .version(http::Version::HTTP_2)
+        .body(body)
+        .map_err(|error| error.to_string())?;
+    *request.headers_mut() = headers;
+    let response = client
+        .request(request)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(response.map(|body| {
+        body.map_err(|error| -> BodyError { Box::new(error) })
+            .boxed()
+    }))
+}
+
+/// Whether `authority` names the proxy listener `peer` connected to.
+fn is_direct(authority: &Authority, peer: &Peer) -> bool {
+    if authority.port_u16() != Some(peer.proxy.port()) {
+        return false;
+    }
+    match authority
+        .host()
+        .trim_matches(['[', ']'])
+        .parse::<std::net::IpAddr>()
+    {
+        Ok(ip) => ip.is_loopback() || ip == peer.proxy.ip(),
+        Err(_) => authority.host().eq_ignore_ascii_case("localhost"),
+    }
+}
+
 pub(crate) async fn serve(
-    adblock_requester: AdblockRequester,
+    proxy: Proxy,
     request: Request<Incoming>,
-    client: reqwest::Client,
     authority: Authority,
     scheme: Scheme,
-    broadcast_sender: broadcast::Sender<Event>,
-    statistics: Statistics,
-    client_ip_address: IpAddr,
-    cancellation: tokio_util::sync::CancellationToken,
-    capture: CaptureStore,
+    peer: Peer,
 ) -> Result<Response<BoxBodyType>, hyper::Error> {
-    let is_direct = matches!(authority.host(), "127.0.0.1" | "localhost" | "::1");
-    if is_direct && authority.port_u16() == Some(8100) {
-        return Ok(get_proxy_status_page());
+    if is_direct(&authority, &peer) {
+        return Ok(direct_response(request.uri().path(), &proxy.ca_der));
     }
+    let Proxy {
+        adblock: adblock_requester,
+        upstream,
+        events: broadcast_sender,
+        statistics,
+        capture,
+        ..
+    } = proxy;
     let scheme_string = scheme.to_string();
     let uri = match http::uri::Builder::new()
         .scheme(scheme)
@@ -97,7 +188,8 @@ pub(crate) async fn serve(
     let mut details = Exchange::default();
     details.request_headers = header_pairs(&headers);
     details.request_version = request.version();
-    details.client = client_ip_address;
+    details.client = peer.ip;
+    details.app = peer.app.as_deref().map(str::to_owned);
     let event = capture.begin(method.to_string(), uri.to_string(), blocked, details);
     log::debug!(
         "HTTP id={} method={} host={} blocked={blocked}",
@@ -108,7 +200,7 @@ pub(crate) async fn serve(
     let exchange = event.exchange.clone();
     let _ = broadcast_sender.send(event);
     let mut pending = PendingResponse(Some(exchange.clone()));
-    statistics.increment_top_clients(client_ip_address);
+    statistics.increment_top_clients(peer.ip);
 
     let response = async {
         if !blocked && headers.contains_key(http::header::UPGRADE) {
@@ -116,7 +208,7 @@ pub(crate) async fn serve(
                 "Protocol upgrade: HTTP handshake captured; upgraded frames are not decoded."
                     .into(),
             );
-            return perform_two_ends_upgrade(request, uri, client, cancellation).await;
+            return perform_two_ends_upgrade(request, uri, peer.cancellation.clone()).await;
         }
         let (_, body) = request.into_parts();
         let body = CaptureBody::new(body, exchange.clone(), true);
@@ -137,10 +229,42 @@ pub(crate) async fn serve(
             }
             return get_blocked_by_privaxy_response(blocker_result);
         }
+        let grpc = is_grpc(&headers);
+        let te_trailers = headers
+            .get(http::header::TE)
+            .is_some_and(|te| te.as_bytes().eq_ignore_ascii_case(b"trailers"));
         let mut request_headers = headers;
         strip_hop_headers(&mut request_headers);
         request_headers.remove(http::header::HOST);
-        let mut response = match client
+        if grpc {
+            if te_trailers {
+                request_headers
+                    .insert(http::header::TE, http::HeaderValue::from_static("trailers"));
+            }
+            let body = BodyExt::boxed(body.map_err(|error| -> BodyError { Box::new(error) }));
+            return match forward_grpc(&upstream.grpc, method, uri, request_headers, body).await {
+                Ok(mut response) => {
+                    statistics.increment_proxied_requests();
+                    exchange.lock().unwrap().response(
+                        response.status().as_u16(),
+                        response.version(),
+                        response.headers(),
+                    );
+                    strip_hop_headers(response.headers_mut());
+                    response
+                }
+                Err(error) => {
+                    log::warn!("Upstream gRPC request failed: {error}");
+                    exchange
+                        .lock()
+                        .unwrap()
+                        .fail(format!("Upstream request failed: {error}"));
+                    get_informative_error_response(&error)
+                }
+            };
+        }
+        let mut response = match upstream
+            .http
             .request(method, uri.to_string())
             .headers(request_headers)
             .body(reqwest::Body::wrap_stream(body.into_data_stream()))
@@ -237,7 +361,7 @@ pub(crate) async fn serve(
     log::debug!(
         "HTTP response status={} client={}",
         response.status(),
-        exchange.lock().unwrap().client
+        peer.ip
     );
     pending.disarm();
     let (parts, body) = response.into_parts();
@@ -425,6 +549,22 @@ fn get_empty_response(status_code: http::StatusCode) -> Response<BoxBodyType> {
         .unwrap()
 }
 
+/// A request addressed to the proxy itself: the inspection CA, or the status page.
+fn direct_response(path: &str, ca_der: &Bytes) -> Response<BoxBodyType> {
+    if path == "/privaxy-ca.crt" {
+        return Response::builder()
+            .status(http::StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "application/x-x509-ca-cert")
+            .header(
+                http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"privaxy-ca.crt\"",
+            )
+            .body(full_body(ca_der.clone()))
+            .unwrap();
+    }
+    get_proxy_status_page()
+}
+
 fn get_proxy_status_page() -> Response<BoxBodyType> {
     let html = r#"<!DOCTYPE html>
 <html>
@@ -462,6 +602,7 @@ fn get_proxy_status_page() -> Response<BoxBodyType> {
         <h1>🛡️ Privaxy</h1>
         <p class="status">✓ Proxy is running</p>
         <p>Configure your browser to use this address as HTTP/HTTPS proxy.</p>
+        <p><a href="/privaxy-ca.crt" style="color: #a855f7">Download the inspection CA</a></p>
     </div>
 </body>
 </html>"#;
@@ -477,7 +618,6 @@ fn get_proxy_status_page() -> Response<BoxBodyType> {
 async fn perform_two_ends_upgrade(
     request: Request<Incoming>,
     uri: Uri,
-    _client: reqwest::Client,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Response<BoxBodyType> {
     // For WebSocket upgrades, we'll tunnel directly
@@ -515,13 +655,14 @@ async fn perform_two_ends_upgrade(
 mod inspection_tests {
     use super::*;
     use crate::blocker::{BlockerRequest, BlockerResult as Decision};
+    use crate::capture::CaptureStore;
     use hyper::{server::conn::http1, service::service_fn};
     use hyper_util::rt::TokioIo;
-    use std::{
-        convert::Infallible,
-        sync::{Arc, Mutex},
+    use std::{convert::Infallible, sync::Mutex};
+    use tokio::{
+        net::TcpListener,
+        sync::{broadcast, oneshot},
     };
-    use tokio::{net::TcpListener, sync::oneshot};
 
     #[tokio::test]
     async fn observe_only_bypasses_filter_decisions_and_empty_cosmetics_preserve_exact_body() {
@@ -645,15 +786,22 @@ mod inspection_tests {
         let proxy_address = listener.local_addr().unwrap();
         let capture_server = capture.clone();
         let proxy = tokio::spawn(async move {
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
-            let (events, _) = broadcast::channel(10);
+            let (ca, key) = crate::ca::make_ca_certificate();
+            let shared = Proxy {
+                adblock: requester,
+                upstream: Upstream::new(reqwest::Client::builder().no_proxy().build().unwrap()),
+                cert_cache: crate::cert::CertCache::new(ca, key),
+                events: broadcast::channel(10).0,
+                statistics: Statistics::new(),
+                exclusions: crate::proxy::exclusions::LocalExclusionStore::new(Vec::new()),
+                capture: capture_server,
+                inspection: crate::inspection::Inspection::new(Default::default(), false),
+                ca_der: Bytes::new(),
+            };
             let mut tasks = tokio::task::JoinSet::new();
             loop {
                 let (tcp, addr) = listener.accept().await.unwrap();
-                let requester = requester.clone();
-                let client = client.clone();
-                let events = events.clone();
-                let capture = capture_server.clone();
+                let shared = shared.clone();
                 tasks.spawn(async move {
                     let _ = http1::Builder::new()
                         .serve_connection(
@@ -661,16 +809,16 @@ mod inspection_tests {
                             service_fn(move |request: Request<Incoming>| {
                                 let authority = request.uri().authority().unwrap().clone();
                                 serve(
-                                    requester.clone(),
+                                    shared.clone(),
                                     request,
-                                    client.clone(),
                                     authority,
                                     Scheme::HTTP,
-                                    events.clone(),
-                                    Statistics::new(),
-                                    addr.ip(),
-                                    Default::default(),
-                                    capture.clone(),
+                                    Peer {
+                                        ip: addr.ip(),
+                                        app: None,
+                                        proxy: proxy_address,
+                                        cancellation: Default::default(),
+                                    },
                                 )
                             }),
                         )

@@ -2,8 +2,9 @@ use lazy_static::lazy_static;
 use std::sync::{Arc, RwLock};
 use wildmatch::WildMatch;
 
+// Each pattern, with the bare domain a leading `*.` also covers.
 #[derive(Debug, Clone)]
-struct WildMatchCollection(Vec<WildMatch>);
+struct WildMatchCollection(Vec<(WildMatch, Option<String>)>);
 
 impl WildMatchCollection {
     fn new(patterns: Vec<String>) -> Self {
@@ -14,7 +15,8 @@ impl WildMatchCollection {
                     // Making things case insensitive
 
                     let pattern_lowercase = pattern.to_lowercase();
-                    WildMatch::new(&pattern_lowercase)
+                    let bare = pattern_lowercase.strip_prefix("*.").map(str::to_owned);
+                    (WildMatch::new(&pattern_lowercase), bare)
                 })
                 .collect(),
         )
@@ -24,9 +26,9 @@ impl WildMatchCollection {
         // Making things case insensitive
         let lowercase_element = element.to_lowercase();
 
-        self.0
-            .iter()
-            .any(|pattern| pattern.matches(&lowercase_element))
+        self.0.iter().any(|(pattern, bare)| {
+            pattern.matches(&lowercase_element) || bare.as_deref() == Some(&lowercase_element)
+        })
     }
 }
 
@@ -97,6 +99,32 @@ impl LocalExclusionStore {
             true
         } else {
             self.0.read().unwrap().is_match(element)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_leading_wildcard_covers_the_domain_and_its_subdomains() {
+        let store =
+            LocalExclusionStore::new(vec!["*.CDNinstagram.com".into(), "exact.test".into()]);
+        for host in [
+            "cdninstagram.com",
+            "scontent.cdninstagram.com",
+            "a.b.cdninstagram.com",
+            "EXACT.test",
+        ] {
+            assert!(store.contains(host), "{host}");
+        }
+        for host in [
+            "evilcdninstagram.com",
+            "cdninstagram.com.evil",
+            "sub.exact.test",
+        ] {
+            assert!(!store.contains(host), "{host}");
         }
     }
 }

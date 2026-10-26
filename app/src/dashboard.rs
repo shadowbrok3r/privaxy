@@ -1,23 +1,160 @@
 //! The desktop workspace: operations and activity together, detailed traffic one click away.
 use super::*;
 use egui::{Color32, RichText, Stroke};
-use egui_theme_kit::Tokens;
+use egui_theme_kit::{Tokens, controls::toggle};
 use num_format::{Locale, ToFormattedString};
 
-fn panel<R>(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
+const CONNECTION_HELP: &str = "Relay: TCP 8101 on every interface. No route to host on Android means the connection never reached the relay: check the selected address, Wi-Fi client isolation and the desktop firewall.\n\nWith a Tailscale exit node on this desktop, allow LAN access in Tailscale so it can reply to the phone.\n\nAndroid runs one VPN at a time: use LAN for Capture all traffic. With the Tailscale Android VPN, keep capture off and use proxy-only mode.\n\nPaired phones receive the inspection CA automatically; install it on the phone under Pairing > Install desktop CA.";
+
+fn card_frame(ui: &egui::Ui) -> egui::Frame {
     let t = Tokens::get(ui.ctx());
     egui::Frame::new()
         .fill(t.raised)
         .stroke(Stroke::new(1., t.card_border))
         .corner_radius(t.radius_md)
         .inner_margin(16)
+}
+/// A card title with `actions` laid out from the right edge.
+fn title_row(ui: &mut egui::Ui, title: &str, actions: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(title).size(17.).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), actions);
+    });
+    ui.add_space(10.);
+}
+fn panel<R>(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    card_frame(ui)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).size(17.).strong());
-            ui.add_space(10.);
+            title_row(ui, title, |_| {});
             content(ui)
         })
         .inner
+}
+/// A card that fills the rest of `ui`.
+fn card<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    card_frame(ui)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_height(ui.available_height());
+            content(ui)
+        })
+        .inner
+}
+/// Runs `add` in a child Ui confined to `rect`.
+fn region<R>(
+    ui: &mut egui::Ui,
+    id: &str,
+    rect: egui::Rect,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(id)
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    add(&mut child)
+}
+/// A multiline text field filling the rest of `ui`; it scrolls once the text outgrows it.
+fn fill_text(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str) {
+    let height = ui.available_height();
+    egui::ScrollArea::vertical()
+        .id_salt(id)
+        .max_height(height)
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(text)
+                    .hint_text(hint)
+                    .desired_width(f32::INFINITY)
+                    .min_size(egui::vec2(0., height - 2.)),
+            );
+        });
+}
+/// The enabled filter lists, grouped; regional lists start collapsed.
+fn filter_lists(ui: &mut egui::Ui, filters: &mut [privaxy::configuration::Filter]) {
+    use privaxy::configuration::FilterGroup;
+    let enabled = filters.iter().filter(|filter| filter.enabled).count();
+    let total = filters.len();
+    title_row(ui, "Filter lists", |ui| {
+        ui.weak(format!("{enabled} of {total} enabled"));
+    });
+    egui::ScrollArea::vertical()
+        .id_salt("filter_lists")
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+            for (group, name) in [
+                (FilterGroup::Default, "Default"),
+                (FilterGroup::Ads, "Ads"),
+                (FilterGroup::Privacy, "Privacy"),
+                (FilterGroup::Malware, "Malware"),
+                (FilterGroup::Social, "Social"),
+                (FilterGroup::Regional, "Regional"),
+            ] {
+                let mut lists: Vec<_> = filters
+                    .iter_mut()
+                    .filter(|filter| filter.group == group)
+                    .collect();
+                if lists.is_empty() {
+                    continue;
+                }
+                let on = lists.iter().filter(|filter| filter.enabled).count();
+                egui::CollapsingHeader::new(format!("{name}  {on}/{}", lists.len()))
+                    .id_salt(name)
+                    .default_open(group != FilterGroup::Regional)
+                    .show(ui, |ui| {
+                        let columns = if ui.available_width() >= 360. { 2 } else { 1 };
+                        let width = ((ui.available_width() - 12. * (columns - 1) as f32)
+                            / columns as f32)
+                            .max(60.);
+                        egui::Grid::new(name)
+                            .num_columns(columns)
+                            .spacing([12., 4.])
+                            .min_col_width(width)
+                            .max_col_width(width)
+                            .show(ui, |ui| {
+                                for (index, filter) in lists.iter_mut().enumerate() {
+                                    ui.checkbox(&mut filter.enabled, &filter.title)
+                                        .on_hover_text(&filter.title);
+                                    if (index + 1) % columns == 0 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                    });
+            }
+        });
+}
+/// Paints the pairing QR code for `code`, at most `max` points wide.
+fn pairing_qr(ui: &mut egui::Ui, code: &str, max: f32) {
+    let Ok(qr) = qrcode::QrCode::new(code.as_bytes()) else {
+        return;
+    };
+    let quiet = 4;
+    let modules = qr.width() + quiet * 2;
+    let scale = (ui.available_width().min(max) / modules as f32).floor().max(1.);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::Vec2::splat(modules as f32 * scale),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 0, Color32::WHITE);
+    for y in 0..qr.width() {
+        for x in 0..qr.width() {
+            if qr[(x, y)] == qrcode::Color::Dark {
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(
+                        rect.min + egui::vec2((x + quiet) as f32 * scale, (y + quiet) as f32 * scale),
+                        egui::vec2(scale, scale),
+                    ),
+                    0,
+                    Color32::BLACK,
+                );
+            }
+        }
+    }
 }
 fn status(ui: &mut egui::Ui, text: &str, color: Color32) {
     ui.horizontal(|ui| {
@@ -92,6 +229,22 @@ fn request_row(ui: &mut egui::Ui, event: &Event, selected: &mut Option<Event>) {
             *selected = Some(event.clone());
         }
     });
+}
+/// Domains passed through after refusing the inspection certificate, minus those since excluded.
+fn passed_through(server: &PrivaxyServer) -> Vec<privaxy::inspection::Rejection> {
+    let mut rejected = server.inspection.rejected();
+    rejected.retain(|rejection| !server.local_exclusion_store.contains(&rejection.domain));
+    rejected
+}
+/// Appends `pattern` to the exclusion draft unless a line already names it.
+fn add_exclusion(draft: &mut String, pattern: &str) {
+    if draft.lines().any(|line| line.trim().eq_ignore_ascii_case(pattern)) {
+        return;
+    }
+    if !draft.is_empty() && !draft.ends_with('\n') {
+        draft.push('\n');
+    }
+    draft.push_str(pattern);
 }
 fn chart(ui: &mut egui::Ui, events: &[Event]) {
     let t = Tokens::get(ui.ctx());
@@ -215,24 +368,26 @@ impl App {
                         ListenerStatus::Failed(reason) => { status(ui, "Listener failed", t.error); ui.label(reason); }
                     }
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("127.0.0.1:8100").size(22.).monospace());
+                        ui.label(RichText::new("127.0.0.1:8100").size(22.).monospace()).on_hover_text("Use this HTTP/HTTPS proxy in your desktop browser or system network settings.");
                         if icons::small_button(ui, svg::COPY, "Copy").clicked() { ui.ctx().copy_text("127.0.0.1:8100".into()); }
                     });
-                    ui.label("Use this HTTP/HTTPS proxy in your desktop browser or system network settings.");
                     ui.add_space(8.);
                     ui.horizontal_wrapped(|ui| {
                         if ui.add_enabled(server.is_some() && !state.is_changing(), icons::button_widget(ui, if state.is_running() { svg::STOP } else { svg::PLAY }, if state.is_running() { "Stop proxy" } else { "Start proxy" })).clicked() {
                             let server = server.unwrap();
                             if state.is_running() { self.stop_relay(); server.listener.stop(); } else { server.listener.start(); }
                         }
-                        if icons::button(ui, svg::DESKTOP, "Connect this computer").clicked() { self.setup_open = true; }
                         if ui.add_enabled(state.is_running() && !self.checking_proxy.load(std::sync::atomic::Ordering::Relaxed), icons::button_widget(ui, svg::PLUGS_CONNECTED, "Test proxy")).clicked() { self.check_proxy(); }
                     });
                     ui.add_space(8.);
                     ui.separator();
                     if let Some(server) = server {
+                        self.capture_controls(ui, server);
+                        ui.separator();
+                    }
+                    if let Some(server) = server {
                         let mut observe_only = !server.blocking_disabled_store.is_enabled();
-                        if icons::checkbox(ui, &mut observe_only, svg::EYE, "Observe only · no blocking").changed() {
+                        if icons::checkbox(ui, &mut observe_only, svg::EYE, "Observe only · no blocking").on_hover_text(if observe_only { "Requests are recorded without ad blocking or HTML injection. HTTPS still requires the inspection CA." } else { "Ad, tracker and cosmetic filters are active." }).changed() {
                             server.blocking_disabled_store.set(!observe_only);
                             let config = {
                                 let mut config = self.config.lock().unwrap();
@@ -241,37 +396,24 @@ impl App {
                             if let Some(config) = config { self.save_settings(config, server); }
                             log::info!("Observe only mode {}", if observe_only { "enabled" } else { "disabled" });
                         }
-                        ui.weak(if observe_only { "Requests are recorded without ad blocking or HTML injection. HTTPS still requires the inspection CA." } else { "Ad, tracker and cosmetic filters are active." });
                     }
                     let counts = self.config.lock().unwrap().as_ref().map(|c| (c.filters.iter().filter(|f| f.enabled).count(), c.filters.len()));
-                    if let Some((enabled, total)) = counts { ui.weak(format!("{enabled} of {total} filter lists enabled")); }
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.link("Manage filters").clicked() { self.tab = Tab::Settings; }
-                        if ui.add_enabled(server.is_some(), icons::button_widget(ui, svg::CERTIFICATE, "Export inspection CA").frame(false)).clicked() { self.export_ca(server.unwrap()); }
-                    });
+                    if let Some((enabled, total)) = counts {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.weak(format!("{enabled} of {total} filter lists enabled"));
+                            if ui.link("Manage").clicked() { self.tab = Tab::Settings; }
+                        });
+                    }
+                    let passed = server.map_or(0, |server| passed_through(server).len());
+                    if passed > 0 {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.colored_label(t.warn, if passed == 1 { "1 domain passes through encrypted".to_owned() } else { format!("{passed} domains pass through encrypted") }).on_hover_text("Their clients refused the inspection certificate this session.");
+                            if ui.link("Review").clicked() { self.tab = Tab::Settings; }
+                        });
+                    }
                 });
                 ui.add_space(12.);
-                panel(ui, "Android connection", |ui| {
-                    let count = self.connections.count();
-                    let connection = match count {
-                        0 => "No phone connected".into(),
-                        1 => "1 phone connected and authenticated".into(),
-                        count => format!("{count} phones connected and authenticated"),
-                    };
-                    status(ui, &connection, if count>0 {t.success} else {t.text_dim});
-                    if count == 0 && self.connections.verified() { ui.weak("A phone connected earlier. Waiting for it to reconnect."); }
-                    ui.label(RichText::new(if self.host.is_empty() { "Select a desktop address".into() } else { format!("{}:8101", self.host) }).monospace());
-                    ui.label(self.relay_status.lock().unwrap().clone());
-                    ui.horizontal_wrapped(|ui| {
-                        let label = if self.relay.is_some() { "Stop Android relay" } else { "Start Android relay" };
-                        if ui.add_enabled(server.is_some() && self.identity.is_some(), icons::button_widget(ui, if self.relay.is_some() { svg::STOP } else { svg::PLUGS_CONNECTED }, label)).clicked() {
-                            if self.relay.is_some() { self.stop_relay(); } else { self.start_relay(server.unwrap()); }
-                        }
-                        if icons::button(ui, svg::QR_CODE, "Pair phone / addresses").clicked() { self.pairing_open = true; }
-                    });
-                    ui.add_space(6.);
-                    ui.weak("Saved pairing is separate from a live connection. A phone appears here only after an authenticated heartbeat.");
-                });
+                panel(ui, "Android connection", |ui| self.android(ui, server));
             });
             ui.add_space(6.);
             ui.vertical(|ui| {
@@ -346,18 +488,23 @@ impl App {
         });
     }
     pub(super) fn settings(&mut self, ui: &mut egui::Ui, server: Option<&PrivaxyServer>) {
-        ui.heading("Settings");
-        ui.add_space(10.);
-        panel(ui, "Appearance", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if icons::button(ui, svg::PALETTE, "Theme presets and templates").clicked() {
-                    self.picker.open = true;
-                }
-                chrome::toggle_row(ui, &mut self.chrome, "Custom title bar");
+        let mut config = self.config.lock().unwrap().clone();
+        let mut save = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Settings").size(23.).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                save = ui
+                    .add_enabled(
+                        server.is_some() && config.is_some(),
+                        icons::button_widget(ui, svg::FLOPPY_DISK, "Save and reload filters"),
+                    )
+                    .on_hover_text("Applies the inspection settings, exclusions and custom rules, and reloads the enabled filter lists.")
+                    .clicked();
             });
         });
-        let mut config = self.config.lock().unwrap().clone();
+        ui.add_space(10.);
         let Some(cfg) = config.as_mut() else {
+            panel(ui, "Appearance", |ui| self.appearance(ui));
             return;
         };
         if !self.drafts_loaded {
@@ -368,156 +515,452 @@ impl App {
                 .cloned()
                 .collect::<Vec<_>>()
                 .join("\n");
+            self.ports = cfg
+                .inspected_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.decrypted_apps = cfg.decrypted_apps.iter().cloned().collect::<Vec<_>>().join("\n");
+            self.lan_clients = cfg.lan_clients.iter().cloned().collect::<Vec<_>>().join("\n");
             self.drafts_loaded = true;
         }
-        ui.add_space(12.);
-        panel(ui, "Filter lists", |ui| {
-            ui.label("Choose which lists block ads, trackers, and unwanted requests.");
-            egui::Grid::new("filter_lists")
-                .num_columns(2)
-                .spacing([24., 8.])
-                .max_col_width((ui.available_width() - 24.) / 2.)
-                .show(ui, |ui| {
-                    for (index, filter) in cfg.filters.iter_mut().enumerate() {
-                        ui.checkbox(&mut filter.enabled, &filter.title);
-                        if index % 2 == 1 {
-                            ui.end_row();
-                        }
+        let full = ui.available_rect_before_wrap();
+        let gap = 12.;
+        let rules = (full.height() * 0.25).clamp(140., 240.);
+        let top = egui::Rect::from_min_max(
+            full.min,
+            egui::pos2(full.right(), full.bottom() - rules - gap),
+        );
+        let split = full.left() + (full.width() * 0.6).clamp(380., (full.width() - 300. - gap).max(380.));
+        region(
+            ui,
+            "settings_inspection",
+            egui::Rect::from_min_max(top.min, egui::pos2(split, top.bottom())),
+            |ui| self.inspection_settings(ui, cfg, server),
+        );
+        region(
+            ui,
+            "settings_side",
+            egui::Rect::from_min_max(egui::pos2(split + gap, top.top()), top.max),
+            |ui| {
+                panel(ui, "Appearance", |ui| self.appearance(ui));
+                ui.add_space(gap);
+                card(ui, |ui| filter_lists(ui, &mut cfg.filters));
+            },
+        );
+        region(
+            ui,
+            "settings_rules",
+            egui::Rect::from_min_max(
+                egui::pos2(full.left(), top.bottom() + gap),
+                egui::pos2(split, full.bottom()),
+            ),
+            |ui| {
+                card(ui, |ui| {
+                    let count = self.custom.lines().filter(|line| !line.trim().is_empty()).count();
+                    title_row(ui, "Custom rules", |ui| {
+                        ui.weak(if count == 1 { "1 rule".to_owned() } else { format!("{count} rules") });
+                    });
+                    fill_text(ui, "custom_rules", &mut self.custom, "One adblock rule per line, e.g. ||ads.example.com^");
+                })
+            },
+        );
+        region(
+            ui,
+            "settings_lan",
+            egui::Rect::from_min_max(egui::pos2(split + gap, top.bottom() + gap), full.max),
+            |ui| self.lan_settings(ui, cfg, server),
+        );
+        ui.allocate_rect(full, egui::Sense::hover());
+        if save {
+            let ports: Result<std::collections::BTreeSet<u16>, _> = self
+                .ports
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|port| !port.is_empty())
+                .map(str::parse)
+                .collect();
+            match ports.ok().filter(|ports| !ports.contains(&0)) {
+                Some(ports) => {
+                    cfg.inspected_ports = ports;
+                    cfg.custom_filters = self
+                        .custom
+                        .lines()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    cfg.exclusions = self
+                        .exclusions
+                        .lines()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    for (draft, set) in [
+                        (&self.decrypted_apps, &mut cfg.decrypted_apps),
+                        (&self.lan_clients, &mut cfg.lan_clients),
+                    ] {
+                        *set = draft
+                            .lines()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .collect();
                     }
-                });
-        });
-        ui.add_space(12.);
-        ui.columns(2,|columns| {
-            panel(&mut columns[0],"Custom rules",|ui| { ui.label("One adblock rule per line."); ui.add(egui::TextEdit::multiline(&mut self.custom).desired_width(f32::INFINITY).desired_rows(6).hint_text("||example.com^")); });
-            panel(&mut columns[1],"HTTPS inspection",|ui| {
-                ui.label("Never intercept these hosts (one per line).");
-                ui.add(egui::TextEdit::multiline(&mut self.exclusions).desired_width(f32::INFINITY).desired_rows(4).hint_text("*.example.com"));
-                if ui.add_enabled(server.is_some(),icons::button_widget(ui, svg::CERTIFICATE, "Export inspection CA")).clicked(){self.export_ca(server.unwrap());}
-                ui.weak("Clients must trust this desktop's CA to inspect HTTPS. Excluded hosts pass through encrypted.");
-            });
-        });
-        ui.add_space(12.);
-        if ui
-            .add_enabled(
-                server.is_some(),
-                icons::button_widget(ui, svg::FLOPPY_DISK, "Save settings and reload filters"),
-            )
-            .clicked()
-        {
-            cfg.custom_filters = self
-                .custom
-                .lines()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect();
-            cfg.exclusions = self
-                .exclusions
-                .lines()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect();
-            self.save_settings(cfg.clone(), server.unwrap());
+                    self.save_settings(cfg.clone(), server.unwrap());
+                }
+                None => {
+                    *self.notice.lock().unwrap() =
+                        "Inspect ports must be numbers from 1 to 65535, separated by commas.".into()
+                }
+            }
         }
         *self.config.lock().unwrap() = config;
     }
-    fn address_picker(&mut self, ui: &mut egui::Ui) {
-        ui.label("Choose the address reachable from the phone. Ethernet and Wi-Fi can be different networks.");
-        for (kind, addresses) in [
-            ("Tailscale", &self.addresses.tailscale),
-            ("LAN", &self.addresses.lan),
-            ("Other interfaces", &self.addresses.other),
-        ] {
-            if addresses.is_empty() {
-                continue;
+    /// Ways to send this desktop's apps and LAN devices through the proxy.
+    fn capture_controls(&mut self, ui: &mut egui::Ui, server: &PrivaxyServer) {
+        ui.horizontal_wrapped(|ui| {
+            let mut system = self.system_proxy.load(std::sync::atomic::Ordering::Relaxed);
+            if toggle(ui, &mut system, "System proxy")
+                .on_hover_text("Points the KDE and GNOME proxy settings at 127.0.0.1:8100, so apps that follow the desktop setting use Privaxy. Your earlier settings come back when you switch it off or quit.")
+                .changed()
+            {
+                self.set_system_proxy(system, server);
             }
-            ui.horizontal_wrapped(|ui| {
-                ui.weak(kind);
-                for entry in addresses {
-                    let address = entry.ip.to_string();
-                    if ui
-                        .selectable_label(
-                            self.host.trim() == address,
-                            format!("{}  {address}", entry.interface),
-                        )
-                        .clicked()
-                    {
-                        self.host = address;
+            if cfg!(target_os = "linux") {
+                let (mut on, starting) = match *self.network_capture.lock().unwrap() {
+                    Capture::Off => (false, false),
+                    Capture::Starting => (true, true),
+                    Capture::On(_) => (true, false),
+                };
+                let label = if starting { "Network capture…" } else { "Network capture" };
+                let response = ui
+                    .add_enabled_ui(!starting, |ui| toggle(ui, &mut on, label))
+                    .inner
+                    .on_hover_text("Firewall rules send this user's web connections to Privaxy, including apps that ignore proxy settings. QUIC is refused so apps fall back to TCP. Asks for the administrator password; the rules go away when you switch it off or quit.");
+                if response.changed() {
+                    self.set_network_capture(on, server);
+                }
+            }
+            let mut lan = self
+                .config
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|cfg| cfg.lan_proxy);
+            if toggle(ui, &mut lan, "LAN devices")
+                .on_hover_text("Serves the proxy on every interface, port 8100, to the addresses under Settings > LAN devices. Point a device's Wi-Fi proxy at this computer, port 8100, and install the CA from http://<this computer>:8100/privaxy-ca.crt.")
+                .changed()
+            {
+                self.set_lan_proxy(lan, server);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if icons::button(ui, svg::BROWSER, "Inspected browser")
+                .on_hover_text("Opens Chromium in its own profile, already using the proxy and trusting the inspection CA. Nothing is installed in your system or browser.")
+                .clicked()
+            {
+                *self.notice.lock().unwrap() = match connect::open_inspected_browser(&server.ca_spki_sha256) {
+                    Ok(name) => format!("Opened {name} with its own profile, through the proxy."),
+                    Err(error) => error,
+                };
+            }
+            if icons::button(ui, svg::TERMINAL_WINDOW, "Copy terminal setup")
+                .on_hover_text("Copies export lines for a shell: the proxy variables, and CA bundles for curl, Python, Git and Node. Paste them into a terminal to send its tools through Privaxy.")
+                .clicked()
+            {
+                match connect::terminal_setup(&server.ca_certificate_pem) {
+                    Ok(lines) => {
+                        ui.ctx().copy_text(lines);
+                        *self.notice.lock().unwrap() = "Terminal setup copied. Paste it into a terminal; it lasts for that shell.".into();
                     }
+                    Err(error) => *self.notice.lock().unwrap() = error,
                 }
-            });
-        }
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.host)
-                    .hint_text("Desktop IPv4 address or hostname")
-                    .desired_width(300.),
-            );
-            if icons::button(ui, svg::ARROWS_CLOCKWISE, "Refresh addresses").clicked() {
-                self.addresses = network::Addresses::detect();
-                if self.host.trim().is_empty() {
-                    self.host = self.addresses.preferred_host();
-                }
+            }
+            if icons::button(ui, svg::CERTIFICATE, "Export CA")
+                .on_hover_text("Saves the inspection CA. Clients must trust it for HTTPS to be inspected.")
+                .clicked()
+            {
+                self.export_ca(server);
             }
         });
     }
-    pub(super) fn dialogs(&mut self, ctx: &egui::Context, server: Option<&PrivaxyServer>) {
-        if self.setup_open {
-            let mut open = true;
-            egui::Window::new("Connect this computer").open(&mut open).default_width(520.).show(ctx,|ui| {
-                ui.heading("Use Privaxy as your desktop proxy");
-                ui.label("The proxy starts when Privaxy opens. In your browser or operating system network settings, configure both HTTP and HTTPS proxy fields:");
-                ui.add_space(8.);
-                ui.monospace("Host: 127.0.0.1     Port: 8100");
-                ui.horizontal_wrapped(|ui| {
-                    if icons::button(ui, svg::COPY, "Copy proxy URL").clicked(){ui.ctx().copy_text("http://127.0.0.1:8100".into());}
-                    if icons::button(ui, svg::TERMINAL_WINDOW, "Copy test command").clicked(){ui.ctx().copy_text("curl --proxy http://127.0.0.1:8100 http://example.com".into());}
-                    if ui.add_enabled(server.is_some(),icons::button_widget(ui, svg::CERTIFICATE, "Export inspection CA")).clicked(){self.export_ca(server.unwrap());}
-                });
-                ui.add_space(10.);
-                ui.label("Trust the exported inspection CA in the browser or system certificate store to inspect HTTPS. Android pairing is optional; this computer can use the proxy on its own.");
-                ui.weak("On Firefox: Settings → Network Settings → Manual proxy configuration. Use this proxy for HTTPS as well.");
-            });
-            self.setup_open = open;
+    fn appearance(&mut self, ui: &mut egui::Ui) {
+        let controls = |ui: &mut egui::Ui| {
+            if icons::button(ui, svg::PALETTE, "Theme presets and templates").clicked() {
+                self.picker.open = true;
+            }
+            chrome::toggle_row(ui, &mut self.chrome, "Custom title bar");
+        };
+        if ui.available_width() >= 360. {
+            ui.horizontal(controls);
+        } else {
+            ui.vertical(controls);
         }
-        if self.pairing_open {
-            let mut open = true;
-            egui::Window::new("Android connection and pairing").open(&mut open).default_width(650.).vscroll(true).show(ctx,|ui| {
-                ui.label(self.connection_label());
-                ui.label(self.relay_status.lock().unwrap().clone());
-                ui.add_space(8.);
-                self.address_picker(ui);
-                ui.add_space(8.);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(server.is_some() && self.identity.is_some(),icons::button_widget(ui, if self.relay.is_some(){svg::STOP}else{svg::PLUGS_CONNECTED}, if self.relay.is_some(){"Stop Android relay"}else{"Start Android relay"})).clicked(){if self.relay.is_some(){self.stop_relay();}else{self.start_relay(server.unwrap());}}
-                    if let Some(identity)=&self.identity { if let Ok(code)=identity.code(&self.host) { if icons::button(ui, svg::LINK, "Copy pairing link").clicked(){ui.ctx().copy_text(code);} } }
-                });
-                ui.label("Scan to open Privaxy on Android, then tap Pair desktop. For an existing pairing, change Desktop IP or hostname and tap Save address on the phone.");
-                icons::label(ui, svg::CERTIFICATE, "The inspection CA is sent automatically over the paired connection.");
-                ui.weak("On Android, use Install desktop CA in Pairing. Android requires approval in Settings once per CA.");
-                if let Some(identity)=&self.identity {
-                    match identity.code(&self.host) {
-                        Ok(code)=>{ if let Ok(qr)=qrcode::QrCode::new(code.as_bytes()) {
-                            let quiet=4; let modules=qr.width()+quiet*2;
-                            let scale=(ui.available_width().min(320.)/modules as f32).floor().max(1.);
-                            let (rect,_)=ui.allocate_exact_size(egui::vec2(modules as f32*scale,modules as f32*scale),egui::Sense::hover());
-                            ui.painter().rect_filled(rect,0,Color32::WHITE);
-                            for y in 0..qr.width(){for x in 0..qr.width(){if qr[(x,y)]==qrcode::Color::Dark {ui.painter().rect_filled(egui::Rect::from_min_size(rect.min+egui::vec2((x+quiet)as f32*scale,(y+quiet)as f32*scale),egui::vec2(scale,scale)),0,Color32::BLACK);}}}
-                        } },
-                        Err(reason)=>{ui.colored_label(Tokens::get(ctx).warn,reason);}
-                    }
+    }
+    fn inspection_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        cfg: &mut privaxy::configuration::Configuration,
+        server: Option<&PrivaxyServer>,
+    ) {
+        card(ui, |ui| {
+            title_row(ui, "HTTPS inspection", |ui| {
+                if ui
+                    .add_enabled(server.is_some(), icons::button_widget(ui, svg::CERTIFICATE, "Export inspection CA"))
+                    .on_hover_text("Clients must trust this desktop's CA for HTTPS to be inspected. Excluded hosts, other ports and refusing domains pass through encrypted.")
+                    .clicked()
+                {
+                    self.export_ca(server.unwrap());
                 }
-                ui.add_space(8.);
-                egui::CollapsingHeader::new("Connection help").default_open(true).show(ui,|ui| {
-                    ui.label("Relay: TCP 8101. If Android reports No route to host, its connection did not reach the relay. Check the selected Wi-Fi address, guest/client isolation, and the desktop firewall for this LAN.");
-                    ui.label("If this desktop uses a Tailscale exit node, allow LAN access in Tailscale so it can reply to the phone. A saved pairing does not prove network reachability.");
-                    ui.label("Android supports one VPN at a time: use LAN for Capture all traffic. With the Tailscale Android VPN, keep capture off and use proxy-only mode with supported apps.");
-                });
-                if icons::button(ui, svg::SHIELD_SLASH, "Revoke all pairings…").clicked(){self.revoke_confirm=true;}
             });
-            self.pairing_open = open;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Inspect ports")
+                    .on_hover_text("CONNECT tunnels to other ports pass through encrypted.");
+                ui.add(egui::TextEdit::singleline(&mut self.ports).desired_width(110.).hint_text("443, 8443"));
+                ui.add_space(12.);
+                ui.checkbox(&mut cfg.pass_through_rejected, "Pass through domains that refuse the certificate")
+                    .on_hover_text("A client that refuses the inspection certificate, with an alert, by hanging up or by not answering, sends its whole domain through encrypted for the rest of the session. Apps that pin certificates, such as Instagram, need this.");
+            });
+            ui.add_space(10.);
+            let area = ui.available_rect_before_wrap();
+            let column = (area.width() - 16.) / 2.;
+            let half = (area.height() - 12.) / 2.;
+            region(
+                ui,
+                "never_intercept",
+                egui::Rect::from_min_size(area.min, egui::vec2(column, half)),
+                |ui| {
+                    ui.label("Never intercept").on_hover_text("One host per line. *.example.com covers example.com and every subdomain. Saved with the settings.");
+                    ui.add_space(4.);
+                    fill_text(ui, "exclusions", &mut self.exclusions, "*.example.com");
+                },
+            );
+            region(
+                ui,
+                "decrypted_apps",
+                egui::Rect::from_min_size(
+                    egui::pos2(area.left(), area.top() + half + 12.),
+                    egui::vec2(column, half),
+                ),
+                |ui| {
+                    ui.label("Decrypt these Android apps").on_hover_text("Package names, one per line; * matches anything. Connections from other apps on a paired phone pass through encrypted from the start, since Android apps other than browsers refuse user-installed CAs. Saved with the settings.");
+                    ui.add_space(4.);
+                    fill_text(ui, "decrypted_apps", &mut self.decrypted_apps, "com.android.chrome");
+                },
+            );
+            region(
+                ui,
+                "passed_through",
+                egui::Rect::from_min_max(egui::pos2(area.right() - column, area.top()), area.max),
+                |ui| self.passed_through_list(ui, server),
+            );
+            ui.allocate_rect(area, egui::Sense::hover());
+        });
+    }
+    fn lan_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        cfg: &mut privaxy::configuration::Configuration,
+        server: Option<&PrivaxyServer>,
+    ) {
+        card(ui, |ui| {
+            let mut lan = cfg.lan_proxy;
+            let mut changed = false;
+            title_row(ui, "LAN devices", |ui| {
+                changed = ui
+                    .add_enabled_ui(server.is_some(), |ui| toggle(ui, &mut lan, "Share proxy"))
+                    .inner
+                    .on_hover_text("Serves the proxy on every interface, port 8100, to the addresses below. Point a device's Wi-Fi proxy at this computer, port 8100, and install the CA from http://<this computer>:8100/privaxy-ca.crt.")
+                    .changed();
+            });
+            if changed && let Some(server) = server {
+                cfg.lan_proxy = lan;
+                let invalid = server.listener.serve_lan(lan, &cfg.lan_clients);
+                if !invalid.is_empty() {
+                    *self.notice.lock().unwrap() = format!(
+                        "Ignored LAN clients that are not addresses or ranges: {}",
+                        invalid.join(", ")
+                    );
+                }
+                self.save_config(cfg.clone(), server);
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("Wi-Fi proxy").on_hover_text("This computer's LAN addresses, for a device's Wi-Fi proxy settings.");
+                for entry in &self.addresses.lan {
+                    ui.monospace(format!("{}:8100", entry.ip));
+                }
+            });
+            ui.label("Allowed addresses").on_hover_text("One address or CIDR range per line. Loopback is always allowed. Saved with the settings.");
+            ui.add_space(4.);
+            fill_text(ui, "lan_clients", &mut self.lan_clients, "192.168.1.0/24");
+        });
+    }
+    fn passed_through_list(&mut self, ui: &mut egui::Ui, server: Option<&PrivaxyServer>) {
+        let t = Tokens::get(ui.ctx());
+        let passed = server.map(passed_through).unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label(format!("Passed through ({})", passed.len()))
+                .on_hover_text("Domains whose clients refused the inspection certificate this session. They stay encrypted until you retry.");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(!passed.is_empty(), icons::button_widget(ui, svg::ARROWS_CLOCKWISE, "Retry").small())
+                    .on_hover_text("Inspect these domains again on their next connection.")
+                    .clicked()
+                {
+                    server.unwrap().inspection.retry();
+                }
+            });
+        });
+        ui.add_space(4.);
+        egui::Frame::new()
+            .fill(t.sunken)
+            .corner_radius(t.radius_sm)
+            .inner_margin(6)
+            .show(ui, |ui| {
+                ui.set_min_size(ui.available_size());
+                egui::ScrollArea::vertical()
+                    .id_salt("passed_through_scroll")
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        if passed.is_empty() {
+                            ui.weak("No domain has refused the certificate this session.");
+                        }
+                        for rejection in &passed {
+                            ui.horizontal(|ui| {
+                                if icons::icon_button(ui, svg::SHIELD_SLASH, "Never intercept: adds it to the list on the left; save to keep it").clicked() {
+                                    add_exclusion(&mut self.exclusions, &rejection.exclusion());
+                                }
+                                ui.add(
+                                    egui::Label::new(RichText::new(format!("{}:{}", rejection.domain, rejection.port)).monospace())
+                                        .truncate()
+                                        .selectable(false),
+                                )
+                                .on_hover_text(format!(
+                                    "{}:{} refused at {} ({})",
+                                    rejection.host,
+                                    rejection.port,
+                                    rejection.at.with_timezone(&chrono::Local).format("%H:%M:%S"),
+                                    rejection.reason
+                                ));
+                            });
+                        }
+                    });
+            });
+    }
+    fn android(&mut self, ui: &mut egui::Ui, server: Option<&PrivaxyServer>) {
+        let t = Tokens::get(ui.ctx());
+        let count = self.connections.count();
+        let (connection, color) = match count {
+            0 if self.connections.verified() => ("Waiting for the phone to reconnect".to_owned(), t.warn),
+            0 => ("No phone connected".to_owned(), t.text_dim),
+            1 => ("1 phone connected".to_owned(), t.success),
+            count => (format!("{count} phones connected"), t.success),
+        };
+        let relay = self.relay_status.lock().unwrap().clone();
+        ui.scope(|ui| status(ui, &connection, color))
+            .response
+            .on_hover_text(format!("{relay}\nA phone counts once it authenticates and answers heartbeats; a saved pairing alone does not."));
+        ui.add_space(6.);
+        self.address_picker(ui);
+        let code = self.identity.as_ref().map(|identity| identity.code(&self.host));
+        if let Some(Err(reason)) = &code {
+            ui.colored_label(t.warn, *reason);
         }
+        ui.add_space(8.);
+        ui.horizontal_wrapped(|ui| {
+            let running = self.relay.is_some();
+            let relay_button = icons::button_widget(
+                ui,
+                if running { svg::STOP } else { svg::PLUGS_CONNECTED },
+                if running { "Stop relay" } else { "Start relay" },
+            );
+            if ui
+                .add_enabled(server.is_some() && self.identity.is_some(), relay_button)
+                .on_hover_text("Paired phones connect over encrypted TCP 8101 on every interface.")
+                .clicked()
+            {
+                if running {
+                    self.stop_relay();
+                } else {
+                    self.start_relay(server.unwrap());
+                }
+            }
+            if ui
+                .add_enabled(matches!(code, Some(Ok(_))), icons::button_widget(ui, svg::LINK, "Copy link"))
+                .on_hover_text("Copies the pairing link; paste it into Privaxy on Android under Pairing.")
+                .clicked()
+                && let Some(Ok(code)) = &code
+            {
+                ui.ctx().copy_text(code.clone());
+            }
+            if icons::button(ui, svg::QR_CODE, if self.pairing_qr { "Hide QR" } else { "Show QR" })
+                .on_hover_text("Scan with the phone camera to open Privaxy, then tap Pair desktop. A paired phone only needs Save address after this address changes.")
+                .clicked()
+            {
+                self.pairing_qr = !self.pairing_qr;
+            }
+            if icons::icon_button(ui, svg::SHIELD_SLASH, "Revoke all pairings…").clicked() {
+                self.revoke_confirm = true;
+            }
+            icons::icon_button(ui, svg::QUESTION, CONNECTION_HELP);
+        });
+        if self.pairing_qr
+            && let Some(Ok(code)) = &code
+        {
+            ui.add_space(8.);
+            pairing_qr(ui, code, 300.);
+        }
+    }
+    fn address_picker(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("relay_addresses")
+            .num_columns(2)
+            .spacing([10., 6.])
+            .show(ui, |ui| {
+                for (kind, hint, addresses) in [
+                    ("Tailscale", "Reachable from a phone on the same tailnet. Capture all traffic cannot run alongside the Tailscale Android VPN.", &self.addresses.tailscale),
+                    ("LAN", "Reachable from a phone on the same network; use it for Capture all traffic.", &self.addresses.lan),
+                    ("Other", "VPN, VM and container interfaces, rarely reachable from a phone.", &self.addresses.other),
+                ] {
+                    if addresses.is_empty() {
+                        continue;
+                    }
+                    ui.weak(kind).on_hover_text(hint);
+                    ui.horizontal_wrapped(|ui| {
+                        for entry in addresses {
+                            let address = entry.ip.to_string();
+                            if ui
+                                .selectable_label(
+                                    self.host.trim() == address,
+                                    format!("{}  {address}", entry.interface),
+                                )
+                                .clicked()
+                            {
+                                self.host = address;
+                            }
+                        }
+                    });
+                    ui.end_row();
+                }
+                ui.weak("Address").on_hover_text("The address the phone dials, carried in the pairing code. The relay listens on every interface.");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.host)
+                            .hint_text("Desktop IPv4 or hostname")
+                            .desired_width(180.),
+                    );
+                    if icons::icon_button(ui, svg::ARROWS_CLOCKWISE, "Refresh addresses").clicked() {
+                        self.addresses = network::Addresses::detect();
+                        if self.host.trim().is_empty() {
+                            self.host = self.addresses.preferred_host();
+                        }
+                    }
+                });
+                ui.end_row();
+            });
+    }
+    pub(super) fn dialogs(&mut self, ctx: &egui::Context) {
         if self.revoke_confirm {
             let modal=egui::Modal::new(egui::Id::unique("revoke_pairings")).show(ctx,|ui| {
                 ui.set_width(360.); ui.heading("Revoke all desktop pairings?");

@@ -56,6 +56,7 @@ rand = "0.9"
 dirs = "6"
 qrcode = { version = "0.14", default-features = false }
 if-addrs = "0.15"
+libc = "0.2"
 
 [features]
 default = []

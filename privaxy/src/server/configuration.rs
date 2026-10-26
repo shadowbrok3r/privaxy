@@ -120,9 +120,75 @@ pub struct Configuration {
     #[serde(default)]
     pub observe_only: bool,
     pub exclusions: BTreeSet<String>,
+    /// CONNECT ports whose TLS is decrypted; tunnels to other ports pass through untouched.
+    #[serde(default = "default_inspected_ports")]
+    pub inspected_ports: BTreeSet<u16>,
+    /// Tunnels a host for the rest of the session once a client refuses the inspection certificate.
+    #[serde(default = "yes")]
+    pub pass_through_rejected: bool,
+    /// Android packages, `*` wildcards allowed, whose relayed connections are decrypted; other apps pass through.
+    #[serde(default = "default_decrypted_apps")]
+    pub decrypted_apps: BTreeSet<String>,
+    /// Serves the proxy on every interface to the clients in `lan_clients`.
+    #[serde(default)]
+    pub lan_proxy: bool,
+    /// Addresses or CIDR ranges allowed to use the proxy over the LAN.
+    #[serde(default = "default_lan_clients")]
+    pub lan_clients: BTreeSet<String>,
+    /// Points the desktop's system proxy at Privaxy while it runs.
+    #[serde(default)]
+    pub system_proxy: bool,
     pub custom_filters: Vec<String>,
     ca: Ca,
     pub filters: Vec<Filter>,
+}
+
+/// Android browsers, which trust user-installed CAs; other apps mostly refuse them.
+pub const BROWSER_APPS: [&str; 18] = [
+    "com.android.chrome",
+    "com.chrome.beta",
+    "com.chrome.dev",
+    "com.chrome.canary",
+    "org.chromium.chrome",
+    "org.mozilla.firefox",
+    "org.mozilla.firefox_beta",
+    "org.mozilla.fenix",
+    "org.mozilla.focus",
+    "com.brave.browser",
+    "com.brave.browser_beta",
+    "com.microsoft.emmx",
+    "com.sec.android.app.sbrowser",
+    "com.opera.browser",
+    "com.opera.mini.native",
+    "com.vivaldi.browser",
+    "com.duckduckgo.mobile.android",
+    "com.kiwibrowser.browser",
+];
+
+/// Private, carrier-grade NAT (Tailscale) and link-local ranges.
+pub const LAN_RANGES: [&str; 6] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",
+    "fc00::/7",
+    "fe80::/10",
+];
+
+fn default_inspected_ports() -> BTreeSet<u16> {
+    BTreeSet::from(crate::inspection::DEFAULT_PORTS)
+}
+
+fn default_decrypted_apps() -> BTreeSet<String> {
+    BROWSER_APPS.iter().map(|app| app.to_string()).collect()
+}
+
+fn default_lan_clients() -> BTreeSet<String> {
+    LAN_RANGES.iter().map(|range| range.to_string()).collect()
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Error, Debug)]
@@ -309,6 +375,12 @@ impl Configuration {
                 ca_private_key: private_key_pem,
             },
             exclusions: BTreeSet::new(),
+            inspected_ports: default_inspected_ports(),
+            pass_through_rejected: true,
+            decrypted_apps: default_decrypted_apps(),
+            lan_proxy: false,
+            lan_clients: default_lan_clients(),
+            system_proxy: false,
             custom_filters: Vec::new(),
         })
     }
@@ -477,6 +549,12 @@ mod tests {
         Configuration {
             observe_only: false,
             exclusions: BTreeSet::from(["trusted.example".into()]),
+            inspected_ports: BTreeSet::from([443, 9443]),
+            pass_through_rejected: false,
+            decrypted_apps: BTreeSet::from(["com.android.chrome".into()]),
+            lan_proxy: true,
+            lan_clients: BTreeSet::from(["192.168.4.0/24".into()]),
+            system_proxy: true,
             custom_filters: vec!["||ads.example^".into()],
             ca: Ca {
                 ca_certificate: "existing certificate".into(),
@@ -540,6 +618,21 @@ mod tests {
         .unwrap();
         assert_eq!(loaded, expected);
         assert_eq!(fs::read(path).await.unwrap(), original);
+    }
+
+    #[test]
+    fn configuration_without_inspection_settings_inspects_https_ports_and_passes_rejections() {
+        let loaded: Configuration = toml::from_str(
+            "exclusions = [\"trusted.example\"]\ncustom_filters = []\nfilters = []\n\n\
+             [ca]\nca_certificate = \"certificate\"\nca_private_key = \"key\"\n",
+        )
+        .unwrap();
+        assert_eq!(loaded.inspected_ports, BTreeSet::from([443, 8443]));
+        assert!(loaded.pass_through_rejected && !loaded.observe_only);
+        assert!(loaded.decrypted_apps.contains("com.android.chrome"));
+        assert!(!loaded.decrypted_apps.contains("com.instagram.android"));
+        assert!(!loaded.lan_proxy && !loaded.system_proxy);
+        assert!(loaded.lan_clients.contains("192.168.0.0/16"));
     }
 
     #[tokio::test]

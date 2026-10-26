@@ -74,3 +74,37 @@ pub fn make_ca_certificate() -> (X509, PKey<Private>) {
 
     (cert, key_pair)
 }
+
+/// SHA-256 of the certificate's public key info, base64, as Chromium's `--ignore-certificate-errors-spki-list` takes it.
+pub fn spki_sha256(certificate: &X509) -> Result<String, openssl::error::ErrorStack> {
+    use base64::Engine as _;
+    let spki = certificate.public_key()?.public_key_to_der()?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(openssl::sha::sha256(&spki)))
+}
+
+#[cfg(test)]
+mod spki_tests {
+    use super::*;
+
+    const FIXTURE: &str = "-----BEGIN CERTIFICATE-----
+MIIBgzCCASmgAwIBAgIUOHDygtBsFf1oa7xumeX0Y5EcC3gwCgYIKoZIzj0EAwIw
+FzEVMBMGA1UEAwwMU1BLSSBmaXh0dXJlMB4XDTI2MTAyNjE2MjMyNVoXDTM2MTAy
+MzE2MjMyNVowFzEVMBMGA1UEAwwMU1BLSSBmaXh0dXJlMFkwEwYHKoZIzj0CAQYI
+KoZIzj0DAQcDQgAEgYt1ZYh+2rHkulUzGkiKG5lj4BuOtzOVCyAlNP7ypmUKSw+w
+aYxCC4XxHbxY9s9klKCIdtXEhQMoGFeiTbD6YqNTMFEwHQYDVR0OBBYEFIFr8IOm
+/j/lYXPm77Jmg4BJqe+1MB8GA1UdIwQYMBaAFIFr8IOm/j/lYXPm77Jmg4BJqe+1
+MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIgS+A2Ld2CGHDUauHT
+59TVuVkV9kyrJup3SM/uzeQeuJICIQD1bmYCvjwFjH3zq3he6VBrVqnN7qL7j7v3
+rQSOZeoFeg==
+-----END CERTIFICATE-----";
+
+    #[test]
+    fn spki_hash_matches_openssl() {
+        // openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64
+        let certificate = X509::from_pem(FIXTURE.as_bytes()).unwrap();
+        assert_eq!(
+            spki_sha256(&certificate).unwrap(),
+            "IGwMb2PY+pKxdRMO9LWDH0qYyCHdfDKUIEb/3v5mlz4="
+        );
+    }
+}

@@ -39,6 +39,8 @@ pub struct Exchange {
     pub response_version: Option<http::Version>,
     pub status: Option<u16>,
     pub client: IpAddr,
+    /// The Android app a paired phone attributed the connection to.
+    pub app: Option<String>,
     pub request_body: Body,
     pub response_body: Body,
     pub response_started_ms: Option<u64>,
@@ -61,6 +63,7 @@ impl Default for Exchange {
             response_version: None,
             status: None,
             client: std::net::Ipv4Addr::LOCALHOST.into(),
+            app: None,
             request_body: Body::default(),
             response_body: Body::default(),
             response_started_ms: None,

@@ -102,7 +102,10 @@ impl Row {
                 .to_string(),
             mime,
             bytes(sent),
-            details.client.to_string(),
+            details
+                .app
+                .clone()
+                .unwrap_or_else(|| details.client.to_string()),
             format!("{:?}", details.request_version),
             event.id.to_string(),
         ];
@@ -325,17 +328,12 @@ impl RowViewer<Row> for Viewer {
         } else {
             tokens.text
         };
-        if ui
-            .add(
-                egui::Label::new(RichText::new(&row.values[column]).color(color))
-                    .truncate()
-                    .sense(egui::Sense::click()),
-            )
-            .on_hover_text(&row.values[column])
-            .clicked()
-        {
-            self.selected = Some(row.event.clone());
-        }
+        ui.add(
+            egui::Label::new(RichText::new(&row.values[column]).color(color))
+                .truncate()
+                .selectable(false),
+        )
+        .on_hover_text(&row.values[column]);
     }
     fn on_cell_view_response(
         &mut self,
@@ -788,7 +786,13 @@ impl Traffic {
                                     "Started",
                                     event.now.with_timezone(&chrono::Local).to_rfc3339(),
                                 ),
-                                ("Client", details.client.to_string()),
+                                (
+                                    "Client",
+                                    match &details.app {
+                                        Some(app) => format!("{app} via {}", details.client),
+                                        None => details.client.to_string(),
+                                    },
+                                ),
                                 (
                                     "Status",
                                     details

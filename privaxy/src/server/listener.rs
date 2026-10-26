@@ -1,8 +1,9 @@
 //! Controllable listener shared by the GUI and the headless proxy.
+use ipnet::IpNet;
 use std::{
     future::Future,
-    net::SocketAddr,
-    sync::{Arc, Mutex},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::{Arc, Mutex, RwLock},
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -28,10 +29,51 @@ impl ListenerStatus {
     }
 }
 
+/// Whether the listener runs, and where.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Desired {
+    enabled: bool,
+    address: SocketAddr,
+}
+
+/// Addresses beyond loopback that may connect; loopback always may.
+#[derive(Clone, Debug, Default)]
+pub struct Allowlist(Arc<RwLock<Vec<IpNet>>>);
+impl Allowlist {
+    /// Replaces the allowed ranges with `entries`, CIDR ranges or single addresses; returns the entries that are neither.
+    pub fn replace<'a>(&self, entries: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+        let mut invalid = Vec::new();
+        let mut ranges = Vec::new();
+        for entry in entries {
+            let entry = entry.trim();
+            match entry
+                .parse::<IpNet>()
+                .or_else(|_| entry.parse::<IpAddr>().map(IpNet::from))
+            {
+                Ok(range) => ranges.push(range),
+                Err(_) => invalid.push(entry.to_owned()),
+            }
+        }
+        *self.0.write().unwrap() = ranges;
+        invalid
+    }
+    pub fn allows(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        ip.is_loopback()
+            || self
+                .0
+                .read()
+                .unwrap()
+                .iter()
+                .any(|range| range.contains(&ip))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProxyListener {
-    enabled: watch::Sender<bool>,
+    desired: watch::Sender<Desired>,
     status: Arc<Mutex<ListenerStatus>>,
+    allowlist: Allowlist,
 }
 impl ProxyListener {
     pub fn status(&self) -> ListenerStatus {
@@ -40,24 +82,61 @@ impl ProxyListener {
     pub fn start(&self) {
         if !self.status().is_running() {
             *self.status.lock().unwrap() = ListenerStatus::Starting;
-            let _ = self.enabled.send(true);
+            self.desired.send_modify(|desired| desired.enabled = true);
         }
     }
     pub fn stop(&self) {
         *self.status.lock().unwrap() = ListenerStatus::Stopping;
-        let _ = self.enabled.send(false);
+        self.desired.send_modify(|desired| desired.enabled = false);
+    }
+    /// Listens on every interface for `clients` when `lan` is set, otherwise on loopback only.
+    ///
+    /// Returns the client entries that are not addresses or CIDR ranges.
+    pub fn serve_lan<'a>(
+        &self,
+        lan: bool,
+        clients: impl IntoIterator<Item = &'a String>,
+    ) -> Vec<String> {
+        let invalid = self.allowlist.replace(clients);
+        let ip = if lan {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        };
+        self.desired.send_if_modified(|desired| {
+            let address = SocketAddr::new(ip, desired.address.port());
+            let changed = desired.address != address;
+            desired.address = address;
+            changed
+        });
+        invalid
     }
     pub(crate) fn spawn<F, Fut>(address: SocketAddr, serve: F) -> Self
     where
         F: Fn(TcpStream, SocketAddr, CancellationToken) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let (enabled, mut desired) = watch::channel(true);
-        let status = Arc::new(Mutex::new(ListenerStatus::Starting));
+        Self::spawn_with(address, true, serve)
+    }
+    /// A listener that starts listening only once `enabled`.
+    pub(crate) fn spawn_with<F, Fut>(address: SocketAddr, enabled: bool, serve: F) -> Self
+    where
+        F: Fn(TcpStream, SocketAddr, CancellationToken) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (sender, mut desired) = watch::channel(Desired { enabled, address });
+        let status = Arc::new(Mutex::new(if enabled {
+            ListenerStatus::Starting
+        } else {
+            ListenerStatus::Stopped
+        }));
         let shared = status.clone();
+        let allowlist = Allowlist::default();
+        let allowed = allowlist.clone();
         tokio::spawn(async move {
             loop {
-                if !*desired.borrow_and_update() {
+                let Desired { enabled, address } = *desired.borrow_and_update();
+                if !enabled {
                     *shared.lock().unwrap() = ListenerStatus::Stopped;
                     if desired.changed().await.is_err() {
                         break;
@@ -71,7 +150,7 @@ impl ProxyListener {
                         log::error!("Cannot listen on {address}: {error}");
                         *shared.lock().unwrap() =
                             ListenerStatus::Failed(format!("Cannot listen on {address}: {error}"));
-                        if !*desired.borrow() {
+                        if !desired.borrow().enabled {
                             continue;
                         }
                         if desired.changed().await.is_err() {
@@ -94,6 +173,9 @@ impl ProxyListener {
                         _ = desired.changed() => break,
                         Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                         accepted = listener.accept() => match accepted {
+                            Ok((_, peer)) if !address.ip().is_loopback() && !allowed.allows(peer.ip()) => {
+                                log::debug!("Proxy refused {peer}: not on the LAN client list");
+                            }
                             Ok((stream, peer)) if tasks.len() < 1024 => {
                                 let cancel = cancellation.clone();
                                 let request = serve(stream, peer, cancel.clone());
@@ -119,13 +201,71 @@ impl ProxyListener {
             }
             *shared.lock().unwrap() = ListenerStatus::Stopped;
         });
-        Self { enabled, status }
+        Self {
+            desired: sender,
+            status,
+            allowlist,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_allowlist_takes_ranges_and_addresses_and_always_admits_loopback() {
+        let allowlist = Allowlist::default();
+        let invalid = allowlist.replace(&[
+            "192.168.4.0/24".to_owned(),
+            " 10.0.0.7 ".to_owned(),
+            "fe80::/10".to_owned(),
+            "not an address".to_owned(),
+        ]);
+        assert_eq!(invalid, ["not an address"]);
+        for ip in [
+            "192.168.4.32",
+            "10.0.0.7",
+            "fe80::1",
+            "127.0.0.1",
+            "::1",
+            "::ffff:192.168.4.9",
+        ] {
+            assert!(allowlist.allows(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["192.168.5.1", "10.0.0.8", "8.8.8.8", "2001:db8::1"] {
+            assert!(!allowlist.allows(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[tokio::test]
+    async fn lan_mode_rebinds_on_every_interface_and_back() {
+        let free = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = free.local_addr().unwrap();
+        drop(free);
+        let listener = ProxyListener::spawn(address, |mut stream, _, _| async move {
+            let _ = stream.write_all(b"ok").await;
+        });
+        wait(&listener, ListenerStatus::is_running).await;
+        listener.serve_lan(true, &["192.168.0.0/16".to_owned()]);
+        wait(
+            &listener,
+            |s| matches!(s, ListenerStatus::Listening(bound) if bound.ip().is_unspecified()),
+        )
+        .await;
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let mut reply = [0; 2];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"ok");
+        listener.serve_lan(false, &[]);
+        wait(
+            &listener,
+            |s| matches!(s, ListenerStatus::Listening(bound) if bound.ip().is_loopback()),
+        )
+        .await;
+        listener.stop();
+        wait(&listener, |s| *s == ListenerStatus::Stopped).await;
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     async fn wait(listener: &ProxyListener, predicate: impl Fn(&ListenerStatus) -> bool) {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
