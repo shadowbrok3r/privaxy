@@ -141,15 +141,21 @@ once per domain. The traffic table's **Client** column shows the app.
    listens on all interfaces at `0.0.0.0:8101`. Pairing codes contain
    the selected address. The regular HTTP proxy stays on `127.0.0.1:8100`.
 2. **Show QR** and scan it with the phone camera to open Privaxy directly on **Pairing**.
-   Review the desktop address and tap **Pair desktop**. Alternatively **Copy link** and
-   paste it into **Paste pairing code**. Existing `privaxy-pair-v1:` codes still work.
-   After pairing, edit **Desktop IP or hostname** and **Relay port** on Android,
-   then **Save address** to switch networks without replacing the pinned certificate.
+   Review the desktop's name and address and tap **Add desktop**. Alternatively **Copy link**
+   and paste it into **Paste pairing code**. Existing `privaxy-pair-v1:` codes still work.
+   The phone keeps every desktop it pairs with, such as a home and a work computer, under
+   **Paired desktops**, and **Use** picks the active one. While the active desktop is
+   unreachable, the phone moves to the next reachable one and makes it active; turn off
+   **Switch to another paired desktop** to stay on one. Pairing again after revoking a
+   desktop's pairings replaces its old entry. Under **Active desktop**, edit
+   **Desktop IP or hostname** and **Relay port**, then **Save name and address** to switch
+   networks without replacing the pinned certificate.
    The authenticated relay automatically sends its public inspection CA to updated Android
    clients. Use **Pairing → Install desktop CA** on the phone, then approve the downloaded
    certificate in Android Security settings. Installation is checked separately from pairing
    and from Android's local CA. The CA is cached and refreshed on reconnect and periodically;
-   a changed CA prompts installation again. Neither CA private key leaves its device.
+   a changed CA prompts installation again. Each paired desktop has its own CA to install.
+   Neither CA private key leaves its device.
 3. Enable **Route captured TCP traffic through desktop**. On LAN, enable
    **Capture all traffic** on Dashboard. With the Tailscale Android VPN, leave
    capture off and point proxy-aware apps at `127.0.0.1:8100`. Keep Privaxy included

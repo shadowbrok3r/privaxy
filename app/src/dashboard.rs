@@ -972,7 +972,7 @@ impl App {
             } else if modal.inner.1 {
                 self.revoke_confirm = false;
                 self.stop_relay();
-                match pairing::Identity::generate() {
+                match pairing::Identity::generate(self.identity.as_ref()) {
                     Ok(identity) => {
                         self.identity = Some(identity);
                         self.connections = Arc::default();

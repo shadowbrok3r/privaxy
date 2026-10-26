@@ -40,32 +40,49 @@ pub struct Identity {
     pub certificate_pem: String,
     cert: Vec<u8>,
     key: Vec<u8>,
+    /// Kept across revokes so phones replace this computer's old pairing.
+    #[serde(default)]
+    desktop_id: String,
 }
 impl Identity {
     pub fn load() -> Result<Self, String> {
         let path = Self::path()?;
-        if path.exists() {
-            return serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string());
+        if !path.exists() {
+            return Self::generate(None);
         }
-        Self::generate()
+        let mut identity: Self =
+            serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        if identity.desktop_id.is_empty() {
+            identity.desktop_id = random_hex::<16>();
+            identity.save()?;
+        }
+        Ok(identity)
     }
     fn path() -> Result<PathBuf, String> {
         Ok(dirs::home_dir()
             .ok_or("No home directory")?
             .join(".privaxy/desktop-pairing.json"))
     }
-    pub fn generate() -> Result<Self, String> {
+    /// New pairing credentials; `previous` keeps this computer's desktop ID.
+    pub fn generate(previous: Option<&Self>) -> Result<Self, String> {
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["privaxy-desktop".into()])
                 .map_err(|e| e.to_string())?;
-        let token: [u8; 32] = rand::random();
         let identity = Self {
-            token: token.iter().map(|b| format!("{b:02x}")).collect(),
+            token: random_hex::<32>(),
             certificate_pem: cert.pem(),
             cert: cert.der().to_vec(),
             key: signing_key.serialize_der(),
+            desktop_id: previous
+                .map(|identity| identity.desktop_id.clone())
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(random_hex::<16>),
         };
+        identity.save()?;
+        Ok(identity)
+    }
+    fn save(&self) -> Result<(), String> {
         let path = Self::path()?;
         std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
         use std::io::Write;
@@ -77,9 +94,8 @@ impl Identity {
             options.mode(0o600);
         }
         let mut file = options.open(path).map_err(|e| e.to_string())?;
-        file.write_all(&serde_json::to_vec(&identity).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        Ok(identity)
+        file.write_all(&serde_json::to_vec(self).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())
     }
     pub fn code(&self, host: &str) -> Result<String, &'static str> {
         use base64::Engine as _;
@@ -99,7 +115,7 @@ impl Identity {
                 "Android needs this computer's IP address; 0.0.0.0 is only a listening address.",
             );
         }
-        let json = serde_json::json!({"version":1,"host":host,"port":LISTEN_ADDRESS.port(),"token":self.token,"certificate_pem":self.certificate_pem}).to_string();
+        let json = serde_json::json!({"version":1,"host":host,"port":LISTEN_ADDRESS.port(),"token":self.token,"certificate_pem":self.certificate_pem,"name":computer_name(),"desktop_id":self.desktop_id}).to_string();
         Ok(format!(
             "privaxy://pair?code={}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
@@ -278,6 +294,32 @@ impl Identity {
     }
 }
 
+/// `N` random bytes as lowercase hex.
+fn random_hex<const N: usize>() -> String {
+    rand::random::<[u8; N]>()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// This computer's host name, shown on the phones it pairs with.
+fn computer_name() -> Option<String> {
+    #[cfg(unix)]
+    let name = {
+        let mut buffer = [0u8; 256];
+        // SAFETY: gethostname writes at most `buffer.len()` bytes into the buffer.
+        if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+            return None;
+        }
+        let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+        String::from_utf8_lossy(&buffer[..end]).into_owned()
+    };
+    #[cfg(not(unix))]
+    let name = std::env::var("COMPUTERNAME").ok()?;
+    let name = name.trim();
+    (!name.is_empty() && name.split('.').next() != Some("localhost")).then(|| name.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +346,7 @@ mod tests {
             certificate_pem: cert.pem(),
             cert: cert.der().to_vec(),
             key: signing_key.serialize_der(),
+            desktop_id: "1f".repeat(16),
         }
     }
 
@@ -500,6 +543,7 @@ mod tests {
             certificate_pem: "test certificate".into(),
             cert: Vec::new(),
             key: Vec::new(),
+            desktop_id: "1f".repeat(16),
         };
         for host in ["100.64.0.5", "192.168.1.10", "desktop.example"] {
             let code = identity.code(&format!(" {host} ")).unwrap();
@@ -509,7 +553,11 @@ mod tests {
             let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(payload["host"], host);
             assert_eq!(payload["port"], 8101);
+            assert_eq!(payload["desktop_id"], "1f".repeat(16));
+            assert_eq!(payload["name"].as_str(), computer_name().as_deref());
         }
+        assert_eq!(random_hex::<16>().len(), 32);
+        assert_ne!(random_hex::<16>(), random_hex::<16>());
         for host in [
             "",
             "0.0.0.0",
@@ -536,6 +584,7 @@ mod tests {
             certificate_pem: cert.pem(),
             cert: cert.der().to_vec(),
             key: signing_key.serialize_der(),
+            desktop_id: "1f".repeat(16),
         };
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.der().clone()).unwrap();
