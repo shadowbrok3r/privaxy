@@ -189,7 +189,8 @@ pub(crate) async fn serve(
     details.request_headers = header_pairs(&headers);
     details.request_version = request.version();
     details.client = peer.ip;
-    details.app = peer.app.as_deref().map(str::to_owned);
+    details.app = peer.app.as_ref().map(|app| app.describe());
+    details.app_package = peer.app.as_ref().and_then(|app| app.package.clone());
     let event = capture.begin(method.to_string(), uri.to_string(), blocked, details);
     log::debug!(
         "HTTP id={} method={} host={} blocked={blocked}",

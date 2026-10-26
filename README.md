@@ -127,7 +127,16 @@ HTTP/2 with their trailers in both directions, so they are inspected instead of 
 from a paired phone are decrypted. It defaults to common browsers, the only Android apps that
 trust user-installed CAs. The phone names the app behind each relayed CONNECT (`Privaxy-App`),
 so every other app's connections pass through encrypted from the first byte instead of failing
-once per domain. The traffic table's **Client** column shows the app.
+once per domain. The traffic table's **Client** column shows the app. Right-click one of its
+sessions, or use **Decrypt** beside its client in the inspector's **Overview**, to add or remove
+the app at once; the change is saved immediately. Apps that pin certificates, or that only trust
+system CAs (most apps other than browsers), refuse decryption and pass through encrypted.
+
+Tunnels and decrypted sessions stay open while traffic flows and close after an hour without
+any, so push and chat connections are not cut off. The traffic table remembers its column
+order, widths, hidden columns and sort, along with the inspector's layout. While **Follow new
+requests** is on, rows stay in arrival order; clicking a column header sorts by it and turns
+Follow off.
 
 1. Use **Android connection** on Dashboard (clicking Android status in the title bar
    opens Dashboard). Hover its controls for help. The computer's Tailscale IPv4 address is selected

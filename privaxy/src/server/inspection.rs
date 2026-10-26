@@ -88,7 +88,7 @@ impl Inspection {
     }
 
     /// Whether connections a paired phone attributed to `package` are decrypted.
-    pub(crate) fn decrypts_app(&self, package: &str) -> bool {
+    pub fn decrypts_app(&self, package: &str) -> bool {
         let package = package.to_ascii_lowercase();
         self.0
             .apps

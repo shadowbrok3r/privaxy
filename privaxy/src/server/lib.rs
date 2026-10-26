@@ -21,6 +21,7 @@ pub mod capture;
 mod cert;
 pub mod configuration;
 pub mod events;
+mod idle;
 pub mod inspection;
 pub mod listener;
 mod proxy;
@@ -28,7 +29,7 @@ pub mod statistics;
 pub mod storage;
 pub mod transparent;
 
-// Shorter timeout for idle connections
+/// Client connections close after this long without traffic.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
@@ -175,17 +176,20 @@ pub async fn try_start_privaxy() -> Result<PrivaxyServer, String> {
                 let service = service_fn(move |req| {
                     proxy::serve_mitm_session(proxy.clone(), peer.clone(), req)
                 });
-                let result = tokio::time::timeout(
-                    IDLE_TIMEOUT,
-                    http1::Builder::new()
-                        .preserve_header_case(true)
-                        .title_case_headers(true)
-                        .keep_alive(true)
-                        .serve_connection(TokioIo::new(stream), service)
-                        .with_upgrades(),
-                )
-                .await;
-                if let Ok(Err(error)) = result {
+                let activity = idle::Activity::new();
+                let stream = idle::Watched::new(stream, activity.clone());
+                let result = activity
+                    .until_idle(
+                        IDLE_TIMEOUT,
+                        http1::Builder::new()
+                            .preserve_header_case(true)
+                            .title_case_headers(true)
+                            .keep_alive(true)
+                            .serve_connection(TokioIo::new(stream), service)
+                            .with_upgrades(),
+                    )
+                    .await;
+                if let Some(Err(error)) = result {
                     log::debug!("Connection error: {error}");
                 }
             }

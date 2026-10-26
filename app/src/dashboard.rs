@@ -17,7 +17,11 @@ fn card_frame(ui: &egui::Ui) -> egui::Frame {
 /// A card title with `actions` laid out from the right edge.
 fn title_row(ui: &mut egui::Ui, title: &str, actions: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(title).size(17.).strong());
+        ui.label(
+            RichText::new(title)
+                .size(17.)
+                .color(Tokens::get(ui.ctx()).primary),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), actions);
     });
     ui.add_space(10.);
@@ -40,6 +44,26 @@ fn card<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
             content(ui)
         })
         .inner
+}
+/// The label above or beside a settings field.
+fn field_label(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+    ui.label(RichText::new(text).color(Tokens::get(ui.ctx()).secondary))
+}
+/// A draft's non-empty lines, trimmed.
+fn draft_lines(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+}
+/// Port numbers separated by commas or spaces; `None` when one is not a port.
+fn draft_ports(text: &str) -> Option<std::collections::BTreeSet<u16>> {
+    text.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|port| !port.is_empty())
+        .map(str::parse)
+        .collect::<Result<std::collections::BTreeSet<u16>, _>>()
+        .ok()
+        .filter(|ports| !ports.contains(&0))
 }
 /// Runs `add` in a child Ui confined to `rect`.
 fn region<R>(
@@ -200,7 +224,11 @@ fn request_row(ui: &mut egui::Ui, event: &Event, selected: &mut Option<Event>) {
         );
         ui.add_sized(
             [62., 23.],
-            egui::Label::new(RichText::new(&event.method).monospace()),
+            egui::Label::new(
+                RichText::new(&event.method)
+                    .monospace()
+                    .color(crate::accent::method(&t, &event.method)),
+            ),
         );
         ui.add_sized(
             [60., 23.],
@@ -346,7 +374,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Network overview").size(23.).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icons::button(ui, svg::PALETTE, "Appearance").clicked() {
+                if crate::accent::action(ui, svg::PALETTE, "Appearance", t.primary).clicked() {
                     self.picker.open = true;
                 }
                 ui.weak("Live session");
@@ -368,16 +396,17 @@ impl App {
                         ListenerStatus::Failed(reason) => { status(ui, "Listener failed", t.error); ui.label(reason); }
                     }
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("127.0.0.1:8100").size(22.).monospace()).on_hover_text("Use this HTTP/HTTPS proxy in your desktop browser or system network settings.");
-                        if icons::small_button(ui, svg::COPY, "Copy").clicked() { ui.ctx().copy_text("127.0.0.1:8100".into()); }
+                        ui.label(RichText::new("127.0.0.1:8100").size(22.).monospace().color(t.secondary)).on_hover_text("Use this HTTP/HTTPS proxy in your desktop browser or system network settings.");
+                        let copy = crate::accent::action_widget(ui, svg::COPY, "Copy", t.primary).small();
+                        if ui.add(copy).clicked() { ui.ctx().copy_text("127.0.0.1:8100".into()); }
                     });
                     ui.add_space(8.);
                     ui.horizontal_wrapped(|ui| {
-                        if ui.add_enabled(server.is_some() && !state.is_changing(), icons::button_widget(ui, if state.is_running() { svg::STOP } else { svg::PLAY }, if state.is_running() { "Stop proxy" } else { "Start proxy" })).clicked() {
+                        if ui.add_enabled(server.is_some() && !state.is_changing(), crate::accent::action_widget(ui, if state.is_running() { svg::STOP } else { svg::PLAY }, if state.is_running() { "Stop proxy" } else { "Start proxy" }, if state.is_running() { t.error } else { t.success })).clicked() {
                             let server = server.unwrap();
                             if state.is_running() { self.stop_relay(); server.listener.stop(); } else { server.listener.start(); }
                         }
-                        if ui.add_enabled(state.is_running() && !self.checking_proxy.load(std::sync::atomic::Ordering::Relaxed), icons::button_widget(ui, svg::PLUGS_CONNECTED, "Test proxy")).clicked() { self.check_proxy(); }
+                        if ui.add_enabled(state.is_running() && !self.checking_proxy.load(std::sync::atomic::Ordering::Relaxed), crate::accent::action_widget(ui, svg::PLUGS_CONNECTED, "Test proxy", t.primary)).clicked() { self.check_proxy(); }
                     });
                     ui.add_space(8.);
                     ui.separator();
@@ -452,7 +481,7 @@ impl App {
                     for (host, count) in hosts.iter().take(4) {
                         ui.horizontal(|ui| {
                             if ui.add(egui::Label::new(host).truncate().sense(egui::Sense::click())).clicked() { self.traffic.search(host.clone()); self.tab=Tab::Traffic; }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.label(count.to_formatted_string(&Locale::en)); });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.label(RichText::new(count.to_formatted_string(&Locale::en)).color(t.secondary)); });
                         });
                         ui.add(egui::ProgressBar::new(*count as f32/max as f32).desired_height(4.).fill(t.secondary));
                         ui.add_space(4.);
@@ -466,7 +495,9 @@ impl App {
             ui.horizontal(|ui| {
                 request_header(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icons::button(ui, svg::ARROWS_DOWN_UP, "Open traffic log").clicked() {
+                    if crate::accent::action(ui, svg::ARROWS_DOWN_UP, "Open traffic log", t.primary)
+                        .clicked()
+                    {
                         self.tab = Tab::Traffic;
                     }
                 });
@@ -490,16 +521,31 @@ impl App {
     pub(super) fn settings(&mut self, ui: &mut egui::Ui, server: Option<&PrivaxyServer>) {
         let mut config = self.config.lock().unwrap().clone();
         let mut save = false;
+        let t = Tokens::get(ui.ctx());
+        let unsaved = config
+            .as_ref()
+            .is_some_and(|cfg| self.unsaved_settings(cfg));
         ui.horizontal(|ui| {
             ui.label(RichText::new("Settings").size(23.).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                save = ui
-                    .add_enabled(
-                        server.is_some() && config.is_some(),
-                        icons::button_widget(ui, svg::FLOPPY_DISK, "Save and reload filters"),
+                let button = if unsaved {
+                    crate::accent::action_widget(
+                        ui,
+                        svg::FLOPPY_DISK,
+                        RichText::new("Save and reload filters").color(t.on_primary),
+                        t.on_primary,
                     )
+                    .fill(t.primary)
+                } else {
+                    crate::accent::action_widget(ui, svg::FLOPPY_DISK, "Save and reload filters", t.primary)
+                };
+                save = ui
+                    .add_enabled(server.is_some() && config.is_some(), button)
                     .on_hover_text("Applies the inspection settings, exclusions and custom rules, and reloads the enabled filter lists.")
                     .clicked();
+                if unsaved {
+                    ui.label(RichText::new("Unsaved changes").color(t.warn));
+                }
             });
         });
         ui.add_space(10.);
@@ -524,6 +570,7 @@ impl App {
             self.decrypted_apps = cfg.decrypted_apps.iter().cloned().collect::<Vec<_>>().join("\n");
             self.lan_clients = cfg.lan_clients.iter().cloned().collect::<Vec<_>>().join("\n");
             self.drafts_loaded = true;
+            self.settings_saved = Some(cfg.clone());
         }
         let full = ui.available_rect_before_wrap();
         let gap = 12.;
@@ -574,40 +621,14 @@ impl App {
         );
         ui.allocate_rect(full, egui::Sense::hover());
         if save {
-            let ports: Result<std::collections::BTreeSet<u16>, _> = self
-                .ports
-                .split(|c: char| c == ',' || c.is_whitespace())
-                .filter(|port| !port.is_empty())
-                .map(str::parse)
-                .collect();
-            match ports.ok().filter(|ports| !ports.contains(&0)) {
+            match draft_ports(&self.ports) {
                 Some(ports) => {
                     cfg.inspected_ports = ports;
-                    cfg.custom_filters = self
-                        .custom
-                        .lines()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned)
-                        .collect();
-                    cfg.exclusions = self
-                        .exclusions
-                        .lines()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned)
-                        .collect();
-                    for (draft, set) in [
-                        (&self.decrypted_apps, &mut cfg.decrypted_apps),
-                        (&self.lan_clients, &mut cfg.lan_clients),
-                    ] {
-                        *set = draft
-                            .lines()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_owned)
-                            .collect();
-                    }
+                    cfg.custom_filters = draft_lines(&self.custom).collect();
+                    cfg.exclusions = draft_lines(&self.exclusions).collect();
+                    cfg.decrypted_apps = draft_lines(&self.decrypted_apps).collect();
+                    cfg.lan_clients = draft_lines(&self.lan_clients).collect();
+                    self.settings_saved = Some(cfg.clone());
                     self.save_settings(cfg.clone(), server.unwrap());
                 }
                 None => {
@@ -617,6 +638,22 @@ impl App {
             }
         }
         *self.config.lock().unwrap() = config;
+    }
+    /// Whether Settings holds edits that Save and reload filters has not written yet.
+    fn unsaved_settings(&self, cfg: &privaxy::configuration::Configuration) -> bool {
+        let Some(saved) = self.settings_saved.as_ref().filter(|_| self.drafts_loaded) else {
+            return false;
+        };
+        draft_ports(&self.ports).as_ref() != Some(&saved.inspected_ports)
+            || draft_lines(&self.custom).ne(saved.custom_filters.iter().cloned())
+            || draft_lines(&self.exclusions).collect::<std::collections::BTreeSet<_>>()
+                != saved.exclusions
+            || draft_lines(&self.decrypted_apps).collect::<std::collections::BTreeSet<_>>()
+                != saved.decrypted_apps
+            || draft_lines(&self.lan_clients).collect::<std::collections::BTreeSet<_>>()
+                != saved.lan_clients
+            || cfg.filters != saved.filters
+            || cfg.pass_through_rejected != saved.pass_through_rejected
     }
     /// Ways to send this desktop's apps and LAN devices through the proxy.
     fn capture_controls(&mut self, ui: &mut egui::Ui, server: &PrivaxyServer) {
@@ -657,7 +694,8 @@ impl App {
             }
         });
         ui.horizontal_wrapped(|ui| {
-            if icons::button(ui, svg::BROWSER, "Inspected browser")
+            let t = Tokens::get(ui.ctx());
+            if crate::accent::action(ui, svg::BROWSER, "Inspected browser", t.primary)
                 .on_hover_text("Opens Chromium in its own profile, already using the proxy and trusting the inspection CA. Nothing is installed in your system or browser.")
                 .clicked()
             {
@@ -666,7 +704,7 @@ impl App {
                     Err(error) => error,
                 };
             }
-            if icons::button(ui, svg::TERMINAL_WINDOW, "Copy terminal setup")
+            if crate::accent::action(ui, svg::TERMINAL_WINDOW, "Copy terminal setup", t.primary)
                 .on_hover_text("Copies export lines for a shell: the proxy variables, and CA bundles for curl, Python, Git and Node. Paste them into a terminal to send its tools through Privaxy.")
                 .clicked()
             {
@@ -678,7 +716,7 @@ impl App {
                     Err(error) => *self.notice.lock().unwrap() = error,
                 }
             }
-            if icons::button(ui, svg::CERTIFICATE, "Export CA")
+            if crate::accent::action(ui, svg::CERTIFICATE, "Export CA", t.primary)
                 .on_hover_text("Saves the inspection CA. Clients must trust it for HTTPS to be inspected.")
                 .clicked()
             {
@@ -688,7 +726,14 @@ impl App {
     }
     fn appearance(&mut self, ui: &mut egui::Ui) {
         let controls = |ui: &mut egui::Ui| {
-            if icons::button(ui, svg::PALETTE, "Theme presets and templates").clicked() {
+            if crate::accent::action(
+                ui,
+                svg::PALETTE,
+                "Theme presets and templates",
+                Tokens::get(ui.ctx()).primary,
+            )
+            .clicked()
+            {
                 self.picker.open = true;
             }
             chrome::toggle_row(ui, &mut self.chrome, "Custom title bar");
@@ -708,7 +753,7 @@ impl App {
         card(ui, |ui| {
             title_row(ui, "HTTPS inspection", |ui| {
                 if ui
-                    .add_enabled(server.is_some(), icons::button_widget(ui, svg::CERTIFICATE, "Export inspection CA"))
+                    .add_enabled(server.is_some(), crate::accent::action_widget(ui, svg::CERTIFICATE, "Export inspection CA", Tokens::get(ui.ctx()).primary))
                     .on_hover_text("Clients must trust this desktop's CA for HTTPS to be inspected. Excluded hosts, other ports and refusing domains pass through encrypted.")
                     .clicked()
                 {
@@ -716,7 +761,7 @@ impl App {
                 }
             });
             ui.horizontal_wrapped(|ui| {
-                ui.label("Inspect ports")
+                field_label(ui, "Inspect ports")
                     .on_hover_text("CONNECT tunnels to other ports pass through encrypted.");
                 ui.add(egui::TextEdit::singleline(&mut self.ports).desired_width(110.).hint_text("443, 8443"));
                 ui.add_space(12.);
@@ -732,7 +777,7 @@ impl App {
                 "never_intercept",
                 egui::Rect::from_min_size(area.min, egui::vec2(column, half)),
                 |ui| {
-                    ui.label("Never intercept").on_hover_text("One host per line. *.example.com covers example.com and every subdomain. Saved with the settings.");
+                    field_label(ui, "Never intercept").on_hover_text("One host per line. *.example.com covers example.com and every subdomain. Saved with the settings.");
                     ui.add_space(4.);
                     fill_text(ui, "exclusions", &mut self.exclusions, "*.example.com");
                 },
@@ -745,7 +790,7 @@ impl App {
                     egui::vec2(column, half),
                 ),
                 |ui| {
-                    ui.label("Decrypt these Android apps").on_hover_text("Package names, one per line; * matches anything. Connections from other apps on a paired phone pass through encrypted from the start, since Android apps other than browsers refuse user-installed CAs. Saved with the settings.");
+                    field_label(ui, "Decrypt these Android apps").on_hover_text("Package names, one per line; * matches anything. Connections from other apps on a paired phone pass through encrypted from the start, since Android apps other than browsers refuse user-installed CAs. Saved with the settings; right-clicking a phone app's session under Traffic adds or removes it at once.");
                     ui.add_space(4.);
                     fill_text(ui, "decrypted_apps", &mut self.decrypted_apps, "com.android.chrome");
                 },
@@ -787,12 +832,18 @@ impl App {
                 self.save_config(cfg.clone(), server);
             }
             ui.horizontal_wrapped(|ui| {
-                ui.weak("Wi-Fi proxy").on_hover_text("This computer's LAN addresses, for a device's Wi-Fi proxy settings.");
+                field_label(ui, "Wi-Fi proxy").on_hover_text(
+                    "This computer's LAN addresses, for a device's Wi-Fi proxy settings.",
+                );
                 for entry in &self.addresses.lan {
-                    ui.monospace(format!("{}:8100", entry.ip));
+                    ui.label(
+                        RichText::new(format!("{}:8100", entry.ip))
+                            .monospace()
+                            .color(Tokens::get(ui.ctx()).text),
+                    );
                 }
             });
-            ui.label("Allowed addresses").on_hover_text("One address or CIDR range per line. Loopback is always allowed. Saved with the settings.");
+            field_label(ui, "Allowed addresses").on_hover_text("One address or CIDR range per line. Loopback is always allowed. Saved with the settings.");
             ui.add_space(4.);
             fill_text(ui, "lan_clients", &mut self.lan_clients, "192.168.1.0/24");
         });
@@ -801,11 +852,11 @@ impl App {
         let t = Tokens::get(ui.ctx());
         let passed = server.map(passed_through).unwrap_or_default();
         ui.horizontal(|ui| {
-            ui.label(format!("Passed through ({})", passed.len()))
+            field_label(ui, format!("Passed through ({})", passed.len()))
                 .on_hover_text("Domains whose clients refused the inspection certificate this session. They stay encrypted until you retry.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add_enabled(!passed.is_empty(), icons::button_widget(ui, svg::ARROWS_CLOCKWISE, "Retry").small())
+                    .add_enabled(!passed.is_empty(), crate::accent::action_widget(ui, svg::ARROWS_CLOCKWISE, "Retry", t.primary).small())
                     .on_hover_text("Inspect these domains again on their next connection.")
                     .clicked()
                 {
@@ -829,7 +880,7 @@ impl App {
                         }
                         for rejection in &passed {
                             ui.horizontal(|ui| {
-                                if icons::icon_button(ui, svg::SHIELD_SLASH, "Never intercept: adds it to the list on the left; save to keep it").clicked() {
+                                if icons::icon_button_tinted(ui, svg::SHIELD_SLASH, "Never intercept: adds it to the list on the left; save to keep it", t.warn).clicked() {
                                     add_exclusion(&mut self.exclusions, &rejection.exclusion());
                                 }
                                 ui.add(
@@ -871,10 +922,11 @@ impl App {
         ui.add_space(8.);
         ui.horizontal_wrapped(|ui| {
             let running = self.relay.is_some();
-            let relay_button = icons::button_widget(
+            let relay_button = crate::accent::action_widget(
                 ui,
                 if running { svg::STOP } else { svg::PLUGS_CONNECTED },
                 if running { "Stop relay" } else { "Start relay" },
+                if running { t.error } else { t.success },
             );
             if ui
                 .add_enabled(server.is_some() && self.identity.is_some(), relay_button)
@@ -888,20 +940,20 @@ impl App {
                 }
             }
             if ui
-                .add_enabled(matches!(code, Some(Ok(_))), icons::button_widget(ui, svg::LINK, "Copy link"))
+                .add_enabled(matches!(code, Some(Ok(_))), crate::accent::action_widget(ui, svg::LINK, "Copy link", t.primary))
                 .on_hover_text("Copies the pairing link; paste it into Privaxy on Android under Pairing.")
                 .clicked()
                 && let Some(Ok(code)) = &code
             {
                 ui.ctx().copy_text(code.clone());
             }
-            if icons::button(ui, svg::QR_CODE, if self.pairing_qr { "Hide QR" } else { "Show QR" })
-                .on_hover_text("Scan with the phone camera to open Privaxy, then tap Pair desktop. A paired phone only needs Save address after this address changes.")
+            if crate::accent::action(ui, svg::QR_CODE, if self.pairing_qr { "Hide QR" } else { "Show QR" }, t.primary)
+                .on_hover_text("Scan with the phone camera to open Privaxy, then tap Add desktop. The phone keeps every desktop it pairs with; after this address changes, edit it on the phone and tap Save name and address.")
                 .clicked()
             {
                 self.pairing_qr = !self.pairing_qr;
             }
-            if icons::icon_button(ui, svg::SHIELD_SLASH, "Revoke all pairings…").clicked() {
+            if icons::icon_button_tinted(ui, svg::SHIELD_SLASH, "Revoke all pairings…", t.error).clicked() {
                 self.revoke_confirm = true;
             }
             icons::icon_button(ui, svg::QUESTION, CONNECTION_HELP);
@@ -926,7 +978,7 @@ impl App {
                     if addresses.is_empty() {
                         continue;
                     }
-                    ui.weak(kind).on_hover_text(hint);
+                    field_label(ui, kind).on_hover_text(hint);
                     ui.horizontal_wrapped(|ui| {
                         for entry in addresses {
                             let address = entry.ip.to_string();
@@ -943,14 +995,14 @@ impl App {
                     });
                     ui.end_row();
                 }
-                ui.weak("Address").on_hover_text("The address the phone dials, carried in the pairing code. The relay listens on every interface.");
+                field_label(ui, "Address").on_hover_text("The address the phone dials, carried in the pairing code. The relay listens on every interface.");
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.host)
                             .hint_text("Desktop IPv4 or hostname")
                             .desired_width(180.),
                     );
-                    if icons::icon_button(ui, svg::ARROWS_CLOCKWISE, "Refresh addresses").clicked() {
+                    if icons::icon_button_tinted(ui, svg::ARROWS_CLOCKWISE, "Refresh addresses", Tokens::get(ui.ctx()).primary).clicked() {
                         self.addresses = network::Addresses::detect();
                         if self.host.trim().is_empty() {
                             self.host = self.addresses.preferred_host();

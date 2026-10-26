@@ -7,6 +7,7 @@ use crate::{
     capture::{CaptureStore, Exchange, PendingResponse},
     cert::CertCache,
     events::Event,
+    idle,
     inspection::Inspection,
     statistics::Statistics,
 };
@@ -36,7 +37,10 @@ pub type BoxBodyType = BoxBody<Bytes, BodyError>;
 
 // Timeout for TLS handshake and tunnel connections
 pub(crate) const TLS_TIMEOUT: Duration = Duration::from_secs(10);
-const TUNNEL_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes for tunnels
+/// Tunnels and decrypted sessions close after this long without a byte in either direction.
+const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// The traffic note for a tunnel closed by [`TUNNEL_IDLE_TIMEOUT`].
+const IDLE_NOTE: &str = "Closed after an hour without traffic in either direction.";
 // Decrypted connections that end unused within this time count as certificate refusals.
 const ENDED_UNUSED_WITHIN: Duration = Duration::from_secs(1);
 // Handshakes still unfinished this long after the client hello count as certificate refusals.
@@ -66,7 +70,7 @@ pub(crate) struct Proxy {
 pub(crate) struct Peer {
     pub(crate) ip: IpAddr,
     /// The Android app a paired phone attributed the connection to.
-    pub(crate) app: Option<Arc<str>>,
+    pub(crate) app: Option<Arc<RelayedApp>>,
     /// The listener address the client reached.
     pub(crate) proxy: SocketAddr,
     pub(crate) cancellation: CancellationToken,
@@ -75,7 +79,7 @@ pub(crate) struct Peer {
 /// The Android app a paired phone attributed a CONNECT to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelayedApp {
-    package: Option<String>,
+    pub(crate) package: Option<String>,
     name: Option<String>,
 }
 
@@ -97,7 +101,7 @@ impl RelayedApp {
     }
 
     /// "Instagram (com.instagram.android)", or whichever of the two is known.
-    fn describe(&self) -> String {
+    pub(crate) fn describe(&self) -> String {
         match (&self.name, &self.package) {
             (Some(name), Some(package)) if name != package => format!("{name} ({package})"),
             (Some(name), _) => name.clone(),
@@ -159,7 +163,7 @@ pub(crate) async fn serve_mitm_session(
     if Method::CONNECT == req.method() {
         let app = RelayedApp::from_headers(req.headers());
         let peer = Peer {
-            app: app.as_ref().map(|app| app.describe().into()),
+            app: app.clone().map(Arc::new),
             ..peer
         };
         let passthrough = passthrough(&authority, &proxy, app.as_ref());
@@ -254,7 +258,8 @@ pub(crate) async fn open_tunnel(
     };
     let mut details = Exchange::default();
     details.client = peer.ip;
-    details.app = peer.app.as_deref().map(str::to_owned);
+    details.app = peer.app.as_ref().map(|app| app.describe());
+    details.app_package = peer.app.as_ref().and_then(|app| app.package.clone());
     details.request_headers = request_headers;
     details.request_version = request_version;
     details.status = Some(if refused.is_some() { 403 } else { 200 });
@@ -305,19 +310,32 @@ pub(crate) async fn serve_tunnel<IO>(
 {
     let cancellation = peer.cancellation.clone();
     let session = async move {
+        let activity = idle::Activity::new();
+        let io = idle::Watched::new(io, activity.clone());
         let mut pending = PendingResponse(Some(exchange.clone()));
         if let Some(reason) = passthrough {
             log::debug!("Tunnelling {authority}: {reason}");
             let mut io = io;
-            match tokio::time::timeout(TUNNEL_TIMEOUT, tunnel(&mut io, &authority, destination))
+            match activity
+                .until_idle(
+                    TUNNEL_IDLE_TIMEOUT,
+                    tunnel(&mut io, &authority, destination),
+                )
                 .await
             {
-                Ok(Ok(())) => exchange.lock().unwrap().finish(),
-                Ok(Err(error)) => exchange
+                Some(Ok(())) => exchange.lock().unwrap().finish(),
+                Some(Err(error)) => exchange
                     .lock()
                     .unwrap()
                     .fail(format!("Tunnel failed: {error}")),
-                Err(_) => exchange.lock().unwrap().fail("Tunnel timed out"),
+                None => {
+                    let mut idle = exchange.lock().unwrap();
+                    idle.note = Some(match idle.note.take() {
+                        Some(note) => format!("{note} {IDLE_NOTE}"),
+                        None => IDLE_NOTE.into(),
+                    });
+                    idle.finish();
+                }
             }
             pending.disarm();
             return;
@@ -414,21 +432,23 @@ pub(crate) async fn serve_tunnel<IO>(
         };
 
         if h2 {
-            let _ = tokio::time::timeout(
-                TUNNEL_TIMEOUT,
-                http2::Builder::new(TokioExecutor::new()).serve_connection(io, service),
-            )
-            .await;
+            let _ = activity
+                .until_idle(
+                    TUNNEL_IDLE_TIMEOUT,
+                    http2::Builder::new(TokioExecutor::new()).serve_connection(io, service),
+                )
+                .await;
         } else {
-            let _ = tokio::time::timeout(
-                TUNNEL_TIMEOUT,
-                http1::Builder::new()
-                    .preserve_header_case(true)
-                    .title_case_headers(true)
-                    .serve_connection(io, service)
-                    .with_upgrades(),
-            )
-            .await;
+            let _ = activity
+                .until_idle(
+                    TUNNEL_IDLE_TIMEOUT,
+                    http1::Builder::new()
+                        .preserve_header_case(true)
+                        .title_case_headers(true)
+                        .serve_connection(io, service)
+                        .with_upgrades(),
+                )
+                .await;
         }
 
         // Records a connection that ended unused right after the handshake as a refusal.
@@ -936,6 +956,18 @@ mod tests {
         assert_eq!(
             (described[2].0.as_str(), described[2].1.as_deref()),
             ("GET", Some("com.android.chrome"))
+        );
+        let packages: Vec<_> = events
+            .iter()
+            .map(|event| event.exchange.lock().unwrap().app_package.clone())
+            .collect();
+        assert_eq!(
+            packages,
+            [
+                Some("com.instagram.android".to_owned()),
+                Some("com.android.chrome".to_owned()),
+                Some("com.android.chrome".to_owned()),
+            ]
         );
     }
 

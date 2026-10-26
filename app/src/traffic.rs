@@ -2,10 +2,11 @@
 pub(crate) mod icons;
 mod presentation;
 
+use crate::accent;
 use eframe::egui::{self, RichText};
 use egui_data_table::{
-    DataTable, Renderer, RowViewer,
-    viewer::{CellWriteContext, DecodeErrorBehavior, RowCodec, TableColumnConfig},
+    CustomMenuItem, DataTable, Renderer, RowViewer, SelectionSnapshot, UserCommand,
+    viewer::{CellWriteContext, DecodeErrorBehavior, RowCodec, TableColumnConfig, UiActionContext},
 };
 use egui_json_tree::{DefaultExpand, JsonTree};
 use egui_theme_kit::Tokens;
@@ -14,6 +15,7 @@ use presentation::{Code, Language, Palette};
 use privaxy::{capture::Exchange, events::Event, storage::BodySnapshot};
 use std::{
     borrow::Cow,
+    collections::BTreeSet,
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
@@ -33,6 +35,8 @@ const COLUMNS: [&str; 12] = [
     "ID",
 ];
 const PAGE: usize = 64 * 1024;
+/// The context menu action that adds or removes a session's app on Decrypt these Android apps.
+const DECRYPT_ACTION: &str = "decrypt_app";
 const JSON_LIMIT: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -259,6 +263,23 @@ impl Follow {
     }
 }
 
+/// A change to Decrypt these Android apps asked for from the traffic view.
+#[derive(Clone)]
+pub(crate) struct AppDecryption {
+    pub package: String,
+    pub label: String,
+    pub decrypt: bool,
+}
+impl AppDecryption {
+    fn verb(&self) -> &'static str {
+        if self.decrypt {
+            "Decrypt"
+        } else {
+            "Stop decrypting"
+        }
+    }
+}
+
 #[derive(Default)]
 struct Viewer {
     filters: Filters,
@@ -266,8 +287,42 @@ struct Viewer {
     selected: Option<Event>,
     scroll_to_end: bool,
     chronological: bool,
+    /// Filters and row order; a change re-filters and re-sorts the table.
+    view_key: (Filters, bool),
+    /// Packages on Decrypt these Android apps.
+    decrypted: BTreeSet<String>,
+    /// The running proxy's decrypt decisions, wildcards included.
+    inspection: Option<privaxy::inspection::Inspection>,
+    /// A change to the decrypted apps asked for from the table or inspector.
+    app_decryption: Option<AppDecryption>,
 }
 impl Viewer {
+    /// The decrypt-list change a session's app offers; `None` without a package or when a wildcard decides it.
+    fn app_toggle(&self, event: &Event) -> Option<AppDecryption> {
+        let (package, label) = {
+            let details = event.exchange.lock().unwrap();
+            let package = details.app_package.clone()?;
+            let label = details.app.clone().unwrap_or_else(|| package.clone());
+            (package, label)
+        };
+        let listed = self
+            .decrypted
+            .iter()
+            .any(|app| app.trim().eq_ignore_ascii_case(&package));
+        if !listed
+            && self
+                .inspection
+                .as_ref()
+                .is_some_and(|inspection| inspection.decrypts_app(&package))
+        {
+            return None;
+        }
+        Some(AppDecryption {
+            package,
+            label,
+            decrypt: !listed,
+        })
+    }
     fn matches(&self, row: &Row) -> bool {
         let f = &self.filters;
         (f.tunnels || row.event.method != "CONNECT" || row.failed)
@@ -320,14 +375,7 @@ impl RowViewer<Row> for Viewer {
                 egui::style::ScrollAnimation::none(),
             );
         }
-        let tokens = Tokens::get(ui.ctx());
-        let color = if column == 0 && row.failed {
-            tokens.error
-        } else if column == 0 && (row.event.is_request_blocked || row.status >= 400) {
-            tokens.warn
-        } else {
-            tokens.text
-        };
+        let color = cell_color(&Tokens::get(ui.ctx()), row, column);
         ui.add(
             egui::Label::new(RichText::new(&row.values[column]).color(color))
                 .truncate()
@@ -350,9 +398,13 @@ impl RowViewer<Row> for Viewer {
         self.selected = Some(row.event.clone());
     }
     fn is_sortable_column(&mut self, _: usize) -> bool {
-        !self.chronological
+        true
     }
     fn compare_cell(&self, a: &Row, b: &Row, column: usize) -> std::cmp::Ordering {
+        // Equal keeps arrival order while following; the saved sort applies again afterwards.
+        if self.chronological {
+            return std::cmp::Ordering::Equal;
+        }
         match column {
             0 => a.status.cmp(&b.status),
             4 => a.received.cmp(&b.received),
@@ -364,7 +416,7 @@ impl RowViewer<Row> for Viewer {
         }
     }
     fn row_filter_hash(&mut self) -> &impl std::hash::Hash {
-        &self.filters
+        &self.view_key
     }
     fn filter_row(&mut self, row: &Row) -> bool {
         self.matches(row)
@@ -406,24 +458,71 @@ impl RowViewer<Row> for Viewer {
         encoding.then_some(Clipboard)
     }
     fn persist_ui_state(&self) -> bool {
-        !self.chronological
+        true
+    }
+    fn custom_context_menu_items(
+        &mut self,
+        _: &UiActionContext,
+        selection: &SelectionSnapshot<'_, Row>,
+    ) -> Vec<CustomMenuItem> {
+        selection
+            .selected_rows
+            .iter()
+            .find_map(|(_, row)| self.app_toggle(&row.event))
+            .map(|change| {
+                CustomMenuItem::new(
+                    DECRYPT_ACTION,
+                    format!("{} {}", change.verb(), change.label),
+                )
+            })
+            .into_iter()
+            .collect()
+    }
+    fn on_custom_action(
+        &mut self,
+        action: &'static str,
+        selection: &SelectionSnapshot<'_, Row>,
+    ) -> Vec<UserCommand<Row>> {
+        if action == DECRYPT_ACTION {
+            self.app_decryption = selection
+                .selected_rows
+                .iter()
+                .find_map(|(_, row)| self.app_toggle(&row.event));
+        }
+        Vec::new()
     }
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+/// Each column's role: states in status colors, identities in accents, measurements dim.
+fn cell_color(t: &Tokens, row: &Row, column: usize) -> egui::Color32 {
+    match column {
+        0 => accent::status(t, row.status, row.failed, row.event.is_request_blocked),
+        1 => accent::method(t, &row.event.method),
+        2 => t.text,
+        4 if row.received == 0 => t.text_faint,
+        8 if row.sent == 0 => t.text_faint,
+        5 if row.duration >= 1000 => t.warn,
+        3..=6 | 8 => t.text_dim,
+        7 => accent::third(t),
+        9 => t.secondary,
+        _ => t.text_faint,
+    }
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Side {
     Request,
     #[default]
     Response,
     Overview,
 }
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Content {
     Headers,
     #[default]
     Body,
 }
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Format {
     #[default]
     Pretty,
@@ -473,10 +572,20 @@ impl<T> BodyLoad<T> {
     }
 }
 
+/// The traffic view's layout choices, kept across restarts.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Layout {
+    follow: bool,
+    split: f32,
+    side: Side,
+    content: Content,
+    format: Format,
+}
+
 pub(super) struct Traffic {
     table: DataTable<Row>,
-    parked_table: DataTable<Row>,
-    table_following: bool,
+    /// The layout last stored in egui memory; `None` until restored.
+    saved_layout: Option<Layout>,
     viewer: Viewer,
     refreshed: Instant,
     split: f32,
@@ -494,8 +603,7 @@ impl Default for Traffic {
     fn default() -> Self {
         Self {
             table: DataTable::new(),
-            parked_table: DataTable::new(),
-            table_following: true,
+            saved_layout: None,
             viewer: Viewer::default(),
             refreshed: Instant::now() - Duration::from_secs(1),
             split: 0.55,
@@ -518,14 +626,50 @@ impl Traffic {
     pub fn search(&mut self, query: String) {
         self.viewer.filters.query = query;
     }
+    /// A change to Decrypt these Android apps asked for since the last call.
+    pub fn take_app_decryption(&mut self) -> Option<AppDecryption> {
+        self.viewer.app_decryption.take()
+    }
+    fn layout(&self) -> Layout {
+        Layout {
+            follow: self.follow.enabled,
+            split: self.split,
+            side: self.side,
+            content: self.content,
+            format: self.format,
+        }
+    }
+    /// Restores the layout from the last session once, then stores each change.
+    fn keep_layout(&mut self, ui: &egui::Ui) {
+        let id = egui::Id::unique("privaxy.traffic.layout");
+        if self.saved_layout.is_none()
+            && let Some(layout) = ui.data_mut(|d| d.get_persisted::<Layout>(id))
+        {
+            self.follow.enabled = layout.follow;
+            self.split = layout.split.clamp(0.25, 0.75);
+            (self.side, self.content, self.format) = (layout.side, layout.content, layout.format);
+        }
+        let layout = self.layout();
+        if self.saved_layout.as_ref() != Some(&layout) {
+            ui.data_mut(|d| d.insert_persisted(id, layout.clone()));
+            self.saved_layout = Some(layout);
+        }
+    }
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         server: Option<&privaxy::PrivaxyServer>,
         events: &[Event],
+        decrypted: &BTreeSet<String>,
         notice: Arc<Mutex<String>>,
     ) {
         icons::install(ui.ctx());
+        self.keep_layout(ui);
+        if self.viewer.decrypted != *decrypted {
+            self.viewer.decrypted = decrypted.clone();
+        }
+        self.viewer.inspection = server.map(|server| server.inspection.clone());
+        let t = Tokens::get(ui.ctx());
         let old_filters = self.viewer.filters.clone();
         let mut cleared = false;
         ui.horizontal_wrapped(|ui| {
@@ -547,7 +691,7 @@ impl Traffic {
                 }
             }).response.on_hover_text(preset.tooltip());
             let active = self.viewer.filters.columns.iter().filter(|q| !q.trim().is_empty()).count();
-            let filter_button = widgets::button(ui, svg::FUNNEL, format!("Column filters ({active})"))
+            let filter_button = accent::action(ui, svg::FUNNEL, format!("Column filters ({active})"), t.primary)
                 .on_hover_text("Filter any column. Fields apply immediately and combine with the selected preset.");
             egui::Popup::menu(&filter_button)
                 .id(ui.make_persistent_id("traffic_column_filter_popup"))
@@ -574,13 +718,13 @@ impl Traffic {
                 });
             });
             widgets::checkbox(ui, &mut self.follow.enabled, svg::ARROW_LINE_DOWN, "Follow new requests")
-                .on_hover_text("Show requests in chronological order, oldest first, and reveal new matching arrivals. Sorting is disabled while following. Turn off to restore your manual table order; the inspector stays on your selected request.");
+                .on_hover_text("Show requests in arrival order, oldest first, and reveal new matching arrivals. Clicking a column header sorts by it and turns this off; turning it off brings back your saved sort.");
             widgets::checkbox(ui, &mut self.viewer.filters.tunnels, svg::PLUGS_CONNECTED, "CONNECT")
                 .on_hover_text("Include successful HTTPS tunnel sessions. Failed tunnels remain visible unless excluded by a filter.");
-            if widgets::button(ui, svg::ARROW_COUNTER_CLOCKWISE, "Reset filters").on_hover_text("Clear search, column filters and presets.").clicked() {
+            if accent::action(ui, svg::ARROW_COUNTER_CLOCKWISE, "Reset filters", t.primary).on_hover_text("Clear search, column filters and presets.").clicked() {
                 self.viewer.filters = Filters::default();
             }
-            if widgets::button(ui, svg::TRASH, "Clear session").on_hover_text("Remove all captured sessions and body files.").clicked() {
+            if accent::action(ui, svg::TRASH, "Clear session", t.error).on_hover_text("Remove all captured sessions and body files.").clicked() {
                 if let Some(server) = server {
                     if let Err(error) = server.capture.clear() {
                         *notice.lock().unwrap() = error.to_string();
@@ -598,7 +742,8 @@ impl Traffic {
         if cleared {
             return;
         }
-        self.sync_follow_order();
+        self.viewer.chronological = self.follow.enabled;
+        self.viewer.view_key = (self.viewer.filters.clone(), self.follow.enabled);
         if self.refreshed.elapsed() >= Duration::from_millis(350)
             || self.table.len() != events.len()
         {
@@ -631,16 +776,18 @@ impl Traffic {
                 .map(|row| row.event.id),
         );
         ui.horizontal_wrapped(|ui| {
-            ui.weak(format!("{filtered} / {} sessions · {} captured", events.len(), bytes(server.map_or(0,|s|s.capture.used()))));
+            ui.label(RichText::new(format!("{filtered} / {} sessions", events.len())).color(t.secondary));
+            ui.label(RichText::new(format!("{} captured", bytes(server.map_or(0, |s| s.capture.used())))).color(t.text_dim));
             if self.follow.enabled {
-                widgets::label(ui, svg::CLOCK, "Chronological · oldest first")
-                    .on_hover_text("Follow is on. Turn it off to sort by any column.");
+                ui.label(RichText::new("Arrival order · oldest first").color(accent::third(&t)))
+                    .on_hover_text("Follow is on. Click a column header to sort by it, which turns Follow off.");
             }
             if self.viewer.body_search.searching() {
                 ui.spinner();
                 ui.weak("Searching captured bodies…");
             }
-            ui.weak("Right-click headers to choose columns. Drag headers or borders to reorder or resize.");
+            ui.add(svg::INFO.image(widgets::IconSize::Md.px(ui)).tint(t.text_dim))
+                .on_hover_text("Right-click headers to choose columns. Drag headers or borders to reorder or resize. Columns, widths and sorting are remembered. Right-click a phone app's session to decrypt it.");
         });
         let errors = self.viewer.body_search.errors();
         if errors > 0 {
@@ -688,19 +835,19 @@ impl Traffic {
         };
         let mut table_ui = ui.new_child(
             egui::UiBuilder::new()
-                .id_salt(if self.follow.enabled {
-                    "follow_sessions_table"
-                } else {
-                    "sessions_table"
-                })
+                .id_salt("sessions_table")
                 .max_rect(table_rect),
         );
         table_ui.set_clip_rect(table_rect.intersect(ui.clip_rect()));
+        // Column names, the only uncolored text the table draws itself.
+        table_ui.visuals_mut().override_text_color = Some(t.primary);
         if events.is_empty() {
             table_ui.label(
                 "No sessions yet. Send traffic through the desktop proxy or a paired phone.",
             );
         }
+        let header =
+            egui::Rect::from_min_size(table_ui.cursor().min, egui::vec2(table_rect.width(), 24.));
         Renderer::new(&mut self.table, &mut self.viewer)
             .with_table_row_height(ui.spacing().interact_size.y.max(24.))
             .with_style_modify(|style| {
@@ -708,20 +855,21 @@ impl Traffic {
                 style.scroll_bar_visibility = egui::scroll_area::ScrollBarVisibility::AlwaysVisible;
             })
             .show(&mut table_ui);
-        ui.allocate_rect(full, egui::Sense::hover());
-    }
-
-    fn sync_follow_order(&mut self) {
-        if self.table_following != self.follow.enabled {
-            // Keep the manually sorted table's opaque UI state intact. The separate follow
-            // table never loads persisted sorting and never permits sorting. Swapping back
-            // restores manual sorting/column choices; dropping its rows avoids two body indexes.
-            std::mem::swap(&mut self.table, &mut self.parked_table);
-            self.parked_table.take();
-            self.table_following = self.follow.enabled;
-            self.refreshed = Instant::now() - Duration::from_secs(1);
+        // A click on a column header sorts by it, so following stops.
+        let click = ui.input(|i| {
+            i.pointer
+                .primary_clicked()
+                .then(|| i.pointer.interact_pos())
+                .flatten()
+        });
+        if self.follow.enabled
+            && click.is_some_and(|pos| {
+                header.contains(pos) && ui.ctx().layer_id_at(pos) == Some(table_ui.layer_id())
+            })
+        {
+            self.follow.enabled = false;
         }
-        self.viewer.chronological = self.follow.enabled;
+        ui.allocate_rect(full, egui::Sense::hover());
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui, event: Event, notice: Arc<Mutex<String>>) {
@@ -733,16 +881,18 @@ impl Traffic {
             self.search_json.clear();
         }
         let details = event.exchange.lock().unwrap().clone();
+        let t = Tokens::get(ui.ctx());
         ui.horizontal(|ui| {
-            ui.strong(format!("{} · Session {}", event.method, event.id));
+            ui.label(RichText::new(&event.method).color(accent::method(&t, &event.method)));
+            ui.label(RichText::new(format!("Session {}", event.id)).color(t.text_dim));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if widgets::button(ui, svg::X_CIRCLE, "Close")
+                if accent::action(ui, svg::X_CIRCLE, "Close", t.error)
                     .on_hover_text("Close the session inspector.")
                     .clicked()
                 {
                     self.viewer.selected = None;
                 }
-                if widgets::button(ui, svg::COPY, "Copy URL")
+                if accent::action(ui, svg::COPY, "Copy URL", t.primary)
                     .on_hover_text("Copy the complete request URL.")
                     .clicked()
                 {
@@ -750,15 +900,20 @@ impl Traffic {
                 }
             });
         });
-        ui.add(egui::Label::new(&event.url).truncate())
+        ui.add(egui::Label::new(RichText::new(&event.url).color(t.primary)).truncate())
             .on_hover_text(&event.url);
         ui.horizontal(|ui| {
-            for (side, icon, label) in [
-                (Side::Request, svg::ARROW_UP, "Request"),
-                (Side::Response, svg::ARROW_DOWN, "Response"),
-                (Side::Overview, svg::INFO, "Overview"),
+            for (side, icon, label, color) in [
+                (Side::Request, svg::ARROW_UP, "Request", t.secondary),
+                (
+                    Side::Response,
+                    svg::ARROW_DOWN,
+                    "Response",
+                    accent::third(&t),
+                ),
+                (Side::Overview, svg::INFO, "Overview", t.primary),
             ] {
-                if widgets::selectable_button(ui, icon, self.side == side, label).clicked()
+                if accent::tab(ui, icon, self.side == side, label, color).clicked()
                     && self.side != side
                 {
                     self.side = side;
@@ -770,21 +925,32 @@ impl Traffic {
         });
         ui.separator();
         if let Some(error) = &details.error {
-            ui.colored_label(Tokens::get(ui.ctx()).error, error);
+            ui.colored_label(t.error, error);
         }
+        let finished = details.finished_at.is_some() || event.is_request_blocked;
         if self.side == Side::Overview {
+            let toggle = self.viewer.app_toggle(&event);
             egui::ScrollArea::vertical()
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .id_salt("overview")
                 .show(ui, |ui| {
+                    // Keeps text clear of the floating scroll bar.
+                    ui.set_max_width(ui.available_width() - 14.);
+                    let status = accent::status(
+                        &t,
+                        details.status.unwrap_or(0),
+                        details.error.is_some(),
+                        event.is_request_blocked,
+                    );
                     egui::Grid::new("exchange_overview")
                         .num_columns(2)
                         .spacing([16., 8.])
                         .show(ui, |ui| {
-                            for (label, value) in [
+                            for (label, value, color) in [
                                 (
                                     "Started",
                                     event.now.with_timezone(&chrono::Local).to_rfc3339(),
+                                    t.text,
                                 ),
                                 (
                                     "Client",
@@ -792,6 +958,7 @@ impl Traffic {
                                         Some(app) => format!("{app} via {}", details.client),
                                         None => details.client.to_string(),
                                     },
+                                    t.secondary,
                                 ),
                                 (
                                     "Status",
@@ -799,6 +966,7 @@ impl Traffic {
                                         .status
                                         .map(|s| s.to_string())
                                         .unwrap_or_else(|| "Pending".into()),
+                                    status,
                                 ),
                                 (
                                     "Decision",
@@ -808,21 +976,34 @@ impl Traffic {
                                         "Allowed"
                                     }
                                     .into(),
+                                    if event.is_request_blocked {
+                                        t.warn
+                                    } else {
+                                        t.success
+                                    },
                                 ),
-                                ("Request protocol", format!("{:?}", details.request_version)),
+                                (
+                                    "Request protocol",
+                                    format!("{:?}", details.request_version),
+                                    t.text_dim,
+                                ),
                                 (
                                     "Response protocol",
                                     details
                                         .response_version
                                         .map(|v| format!("{v:?}"))
                                         .unwrap_or_default(),
+                                    t.text_dim,
                                 ),
                                 (
                                     "Response headers after",
                                     details
                                         .response_started_ms
                                         .map(|v| format!("{v} ms"))
-                                        .unwrap_or_else(|| "Pending".into()),
+                                        .unwrap_or_else(|| {
+                                            if finished { "None" } else { "Pending" }.into()
+                                        }),
+                                    t.text,
                                 ),
                                 (
                                     "Total duration",
@@ -830,18 +1011,46 @@ impl Traffic {
                                         .duration_ms
                                         .map(|v| format!("{v} ms"))
                                         .unwrap_or_else(|| "In progress".into()),
+                                    t.text,
                                 ),
-                                ("Request body", bytes(details.request_body.seen())),
-                                ("Response body", bytes(details.response_body.seen())),
+                                ("Request body", bytes(details.request_body.seen()), t.text),
+                                ("Response body", bytes(details.response_body.seen()), t.text),
                             ] {
-                                ui.weak(label);
-                                ui.label(value);
+                                ui.label(RichText::new(label).color(t.primary));
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new(value).color(color));
+                                    if label == "Client"
+                                        && let Some(change) = &toggle
+                                        && {
+                                            let icon = if change.decrypt {
+                                                svg::LOCK_OPEN
+                                            } else {
+                                                svg::LOCK
+                                            };
+                                            let button = accent::action_widget(
+                                                ui,
+                                                icon,
+                                                change.verb(),
+                                                t.primary,
+                                            );
+                                            ui.add(button.small())
+                                        }
+                                        .on_hover_text(if change.decrypt {
+                                            "Adds this app to Decrypt these Android apps. Its next connections are decrypted; apps that pin certificates or ignore user-installed CAs refuse and pass through."
+                                        } else {
+                                            "Removes this app from Decrypt these Android apps, so its next connections pass through encrypted."
+                                        })
+                                        .clicked()
+                                    {
+                                        self.viewer.app_decryption = toggle.clone();
+                                    }
+                                });
                                 ui.end_row();
                             }
                         });
                     if let Some(note) = &details.note {
                         ui.add_space(12.);
-                        ui.label(note);
+                        note_label(ui, note, details.error.is_some() || event.is_request_blocked);
                     }
                 });
             return;
@@ -857,25 +1066,37 @@ impl Traffic {
         } else {
             &details.response_trailers
         };
+        let side_color = if request {
+            t.secondary
+        } else {
+            accent::third(&t)
+        };
         ui.horizontal(|ui| {
-            if widgets::selectable_button(
+            if accent::tab(
                 ui,
                 svg::LIST_BULLETS,
                 self.content == Content::Headers,
                 format!("Headers ({})", headers.len()),
+                side_color,
             )
             .clicked()
             {
                 self.content = Content::Headers;
             }
-            if widgets::selectable_button(ui, svg::FILE_CODE, self.content == Content::Body, "Body")
-                .clicked()
+            if accent::tab(
+                ui,
+                svg::FILE_CODE,
+                self.content == Content::Body,
+                "Body",
+                side_color,
+            )
+            .clicked()
             {
                 self.content = Content::Body;
             }
         });
         if self.content == Content::Headers {
-            if widgets::button(ui, svg::COPY, "Copy headers")
+            if accent::action(ui, svg::COPY, "Copy headers", t.primary)
                 .on_hover_text("Copy all headers and trailers.")
                 .clicked()
             {
@@ -892,14 +1113,18 @@ impl Traffic {
                 .id_salt(("headers", request))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    header_rows(ui, headers);
+                    header_rows(ui, headers, side_color);
                     if !trailers.is_empty() {
                         ui.separator();
-                        ui.strong("Trailers");
-                        ui.push_id("trailers", |ui| header_rows(ui, trailers));
+                        ui.label(RichText::new("Trailers").color(side_color));
+                        ui.push_id("trailers", |ui| header_rows(ui, trailers, side_color));
                     }
                     if headers.is_empty() {
-                        ui.weak("No headers received yet.");
+                        ui.weak(if finished {
+                            "No headers."
+                        } else {
+                            "No headers received yet."
+                        });
                     }
                 });
             return;
@@ -910,10 +1135,16 @@ impl Traffic {
             details.response_body.snapshot()
         };
         if let Some(error) = &snapshot.error {
-            ui.colored_label(Tokens::get(ui.ctx()).warn, error);
+            ui.colored_label(t.warn, error);
         }
         if let Some(note) = &details.note {
-            ui.label(note);
+            note_label(ui, note, event.is_request_blocked);
+        }
+        if event.method == "CONNECT" {
+            if details.note.is_none() {
+                ui.label(RichText::new("A tunnel has no body of its own: requests decrypted inside it appear as their own rows, and other bytes pass through encrypted.").color(t.text_dim));
+            }
+            return;
         }
         self.body_view(
             ui,
@@ -921,9 +1152,9 @@ impl Traffic {
             snapshot,
             request,
             if request {
-                details.request_complete
+                details.request_complete || finished
             } else {
-                details.finished_at.is_some()
+                finished
             },
             Language::detect(
                 headers
@@ -1012,13 +1243,14 @@ impl Traffic {
                 (Format::Text, svg::FILE_CODE, "Source"),
                 (Format::Hex, svg::HASH, "Hex"),
             ] {
-                if widgets::selectable_button(ui, icon, self.format == mode, label).clicked() { self.format = mode; }
+                if accent::tab(ui, icon, self.format == mode, label, Tokens::get(ui.ctx()).primary).clicked() { self.format = mode; }
             }
             let kind = if loaded.value.as_ref().and_then(|v| v.as_ref().ok()).is_some_and(|data| data.text.is_none()) {
                 "Binary"
             } else { language.name() };
-            ui.weak(format!("{kind} · {}", bytes(snapshot.len)));
-            let copy = widgets::button_widget(ui, svg::COPY, "Copy body");
+            let t = Tokens::get(ui.ctx());
+            ui.label(RichText::new(format!("{kind} · {}", bytes(snapshot.len))).color(accent::third(&t)));
+            let copy = accent::action_widget(ui, svg::COPY, "Copy body", t.primary);
             if ui.add_enabled(snapshot.len > 0, copy)
                 .on_hover_text("Copy the complete captured UTF-8 body, including all pages, without formatting. Use Export body for binary data.").clicked() {
                 let body = snapshot.clone();
@@ -1034,7 +1266,7 @@ impl Traffic {
                     ctx.request_repaint();
                 });
             }
-            let export = widgets::button_widget(ui, svg::DOWNLOAD_SIMPLE, "Export body");
+            let export = accent::action_widget(ui, svg::DOWNLOAD_SIMPLE, "Export body", t.primary);
             if ui
                 .add_enabled(snapshot.len > 0, export)
                 .on_hover_text("Save every captured byte to a file, including all pages. Source bytes are never reformatted.")
@@ -1084,7 +1316,9 @@ impl Traffic {
             }
         };
         if snapshot.len == 0 {
-            ui.weak(if complete {
+            ui.weak(if event.is_request_blocked {
+                "Blocked before anything was sent."
+            } else if complete {
                 "Empty body."
             } else {
                 "Waiting for body bytes…"
@@ -1111,9 +1345,14 @@ impl Traffic {
                         .hint_text("Find JSON keys or values")
                         .desired_width(180.),
                 );
-                if widgets::button(ui, svg::COPY, "Copy formatted JSON")
-                    .on_hover_text("Copy the complete formatted JSON document.")
-                    .clicked()
+                if accent::action(
+                    ui,
+                    svg::COPY,
+                    "Copy formatted JSON",
+                    Tokens::get(ui.ctx()).primary,
+                )
+                .on_hover_text("Copy the complete formatted JSON document.")
+                .clicked()
                 {
                     ui.ctx().copy_text(
                         document_data
@@ -1179,13 +1418,13 @@ impl Traffic {
             if full_document {
                 ui.horizontal_wrapped(|ui| {
                     ui.weak(format!("Complete formatted body · {} · {} lines", bytes(code.text.len() as u64), code.line_count()));
-                    if widgets::button(ui, svg::COPY, "Copy formatted body").on_hover_text("Copy the complete formatted document. Copy body and Export body preserve the original bytes.").clicked() {
+                    if accent::action(ui, svg::COPY, "Copy formatted body", Tokens::get(ui.ctx()).primary).on_hover_text("Copy the complete formatted document. Copy body and Export body preserve the original bytes.").clicked() {
                         ui.ctx().copy_text(code.text.clone());
                     }
                 });
             } else {
                 ui.horizontal_wrapped(|ui| {
-                let previous = widgets::button_widget(ui, svg::ARROW_LEFT, "Previous");
+                let previous = accent::action_widget(ui, svg::ARROW_LEFT, "Previous", Tokens::get(ui.ctx()).primary);
                 if ui
                     .add_enabled(self.page > 0, previous)
                     .clicked()
@@ -1193,14 +1432,14 @@ impl Traffic {
                     self.page -= 1;
                 }
                 ui.label(format!("Page {} / {pages}", self.page + 1));
-                let next = widgets::button_widget(ui, svg::ARROW_RIGHT, "Next");
+                let next = accent::action_widget(ui, svg::ARROW_RIGHT, "Next", Tokens::get(ui.ctx()).primary);
                 if ui
                     .add_enabled(self.page + 1 < pages, next)
                     .clicked()
                 {
                     self.page += 1;
                 }
-                if widgets::button(ui, svg::COPY, "Copy page").on_hover_text("Copy this displayed preview. Copy body copies the complete captured source.").clicked() {
+                if accent::action(ui, svg::COPY, "Copy page", Tokens::get(ui.ctx()).primary).on_hover_text("Copy this displayed preview. Copy body copies the complete captured source.").clicked() {
                     ui.ctx().copy_text(code.text.clone());
                 }
             });
@@ -1219,18 +1458,28 @@ impl Traffic {
     }
 }
 
-fn header_rows(ui: &mut egui::Ui, headers: &[(String, String)]) {
+fn header_rows(ui: &mut egui::Ui, headers: &[(String, String)], key: egui::Color32) {
+    let value = Tokens::get(ui.ctx()).text;
     egui::Grid::new(ui.scope_id().with("header_values"))
         .num_columns(2)
         .spacing([14., 7.])
         .striped(true)
         .show(ui, |ui| {
-            for (name, value) in headers {
-                ui.label(RichText::new(name).strong());
-                ui.add(egui::Label::new(value).wrap());
+            for (name, text) in headers {
+                ui.label(RichText::new(name).color(key));
+                ui.add(egui::Label::new(RichText::new(text).color(value)).wrap());
                 ui.end_row();
             }
         });
+}
+/// A session note behind an info icon, in warn when it explains a block or failure.
+fn note_label(ui: &mut egui::Ui, note: &str, problem: bool) {
+    let t = Tokens::get(ui.ctx());
+    let color = if problem { t.warn } else { accent::third(&t) };
+    ui.horizontal_top(|ui| {
+        ui.add(svg::INFO.image(widgets::IconSize::Md.px(ui)).tint(color));
+        ui.add(egui::Label::new(RichText::new(note).color(color)).wrap());
+    });
 }
 fn bytes(value: u64) -> String {
     if value >= 1024 * 1024 {

@@ -6,6 +6,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+mod accent;
 mod connect;
 mod dashboard;
 mod diagnostics;
@@ -52,6 +53,8 @@ struct App {
     decrypted_apps: String,
     lan_clients: String,
     drafts_loaded: bool,
+    /// Settings as last loaded or saved, to tell when Settings has unsaved edits.
+    settings_saved: Option<privaxy::configuration::Configuration>,
     identity: Option<pairing::Identity>,
     relay: Option<tokio::task::JoinHandle<()>>,
     relay_status: Arc<Mutex<String>>,
@@ -96,6 +99,7 @@ impl App {
             decrypted_apps: String::new(),
             lan_clients: String::new(),
             drafts_loaded: false,
+            settings_saved: None,
             identity: identity.ok(),
             relay: None,
             connections: Arc::default(),
@@ -270,6 +274,45 @@ impl App {
             self.save_config(config, server);
         }
     }
+    /// Adds or removes an app on Decrypt these Android apps, effective from its next connection.
+    fn decrypt_app(&mut self, change: traffic::AppDecryption, server: &PrivaxyServer) {
+        let traffic::AppDecryption {
+            package,
+            label,
+            decrypt,
+        } = change;
+        self.update_config(server, |cfg| {
+            cfg.decrypted_apps
+                .retain(|app| !app.trim().eq_ignore_ascii_case(&package));
+            if decrypt {
+                cfg.decrypted_apps.insert(package.clone());
+            }
+        });
+        if let Some(cfg) = self.config.lock().unwrap().as_ref() {
+            server.inspection.set_decrypted_apps(&cfg.decrypted_apps);
+            if let Some(saved) = &mut self.settings_saved {
+                saved.decrypted_apps = cfg.decrypted_apps.clone();
+            }
+        }
+        // The Settings draft follows, keeping any other unsaved lines.
+        let mut lines: Vec<&str> = self
+            .decrypted_apps
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.eq_ignore_ascii_case(&package))
+            .collect();
+        if decrypt {
+            lines.push(&package);
+        }
+        self.decrypted_apps = lines.join("\n");
+        *self.notice.lock().unwrap() = if decrypt {
+            format!(
+                "Decrypting {label} from its next connection. Apps that pin certificates or ignore user-installed CAs refuse and pass through encrypted."
+            )
+        } else {
+            format!("{label} passes through encrypted from its next connection.")
+        };
+    }
     fn set_system_proxy(&self, on: bool, server: &PrivaxyServer) {
         self.update_config(server, |cfg| cfg.system_proxy = on);
         let (state, notice) = (self.system_proxy.clone(), self.notice.clone());
@@ -405,13 +448,14 @@ impl eframe::App for App {
             .frameless(self.chrome.frameless)
             .show(ui, |ui, side| match side {
                 egui_theme_kit::title_bar::Side::Left => {
+                    let primary = egui_theme_kit::Tokens::get(ui.ctx()).primary;
                     for (tab, icon, label) in [
                         (Tab::Dashboard, svg::GAUGE, "Dashboard"),
                         (Tab::Traffic, svg::ARROWS_DOWN_UP, "Traffic"),
                         (Tab::Settings, svg::SLIDERS, "Settings"),
                         (Tab::Logs, svg::SCROLL, "Logs"),
                     ] {
-                        if icons::selectable_button(ui, icon, self.tab == tab, label).clicked() {
+                        if accent::tab(ui, icon, self.tab == tab, label, primary).clicked() {
                             self.tab = tab;
                         }
                     }
@@ -476,8 +520,25 @@ impl eframe::App for App {
                             .inner
                     }
                     Tab::Traffic => {
-                        self.traffic
-                            .show(ui, server.as_ref(), &events, self.notice.clone())
+                        let decrypted = self
+                            .config
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .map(|config| config.decrypted_apps.clone())
+                            .unwrap_or_default();
+                        self.traffic.show(
+                            ui,
+                            server.as_ref(),
+                            &events,
+                            &decrypted,
+                            self.notice.clone(),
+                        );
+                        if let Some(change) = self.traffic.take_app_decryption()
+                            && let Some(server) = &server
+                        {
+                            self.decrypt_app(change, server);
+                        }
                     }
                     Tab::Logs => self.logs.show(ui, self.notice.clone()),
                     Tab::Settings => self.settings(ui, server.as_ref()),
